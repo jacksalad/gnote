@@ -1,0 +1,15 @@
+# 统一文本换行：仓库内一律 LF，Windows 下由编辑器/工具自行处理显示。
+# gofmt 门禁依赖工作树为 LF，否则 gofmt -l 会把所有 CRLF 文件误报为未格式化。
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF，避免旧版 PowerShell 对 LF 的兼容性问题
+*.ps1 text eol=crlf
+
+# 二进制资源不得做换行转换
+*.ttf binary
+*.ico binary
+*.syso binary
+*.exe binary
+*.png binary
+*.zip binary
+*.cer binary
