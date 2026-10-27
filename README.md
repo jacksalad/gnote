@@ -7,6 +7,13 @@
 - 平台：Windows 10 / 11 x64
 - 工具链：Go 1.25+（推荐 1.27+）
 
+## 截图
+
+<p align="center">
+  <img src="docs/images/screenshot-1.png" alt="gnote 主界面" width="49%">
+  <img src="docs/images/screenshot-2.png" alt="gnote 编辑界面" width="49%">
+</p>
+
 ## 特性
 
 - **零 CGO**：`syscall.NewLazyDLL` 动态绑定 Win32 / GDI，无需 MinGW 或 C/C++ 工具链。

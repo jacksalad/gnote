@@ -491,11 +491,24 @@ func globalWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 
 // dispatchEvent 分发事件给 EventBus 和 rootComponent，并在组件消费事件时自动重绘呈现
 func (w *Window) dispatchEvent(evt event.Event) {
+	if atomic.LoadInt32(&w.closed) != 0 {
+		return
+	}
 	w.eventBus.Publish(evt)
+	// 事件处理器可能在本轮分发中关闭窗口（如设置窗口的“取消”按钮、Esc、
+	// 文件菜单“退出”）；窗口销毁时渲染目标已释放，必须立即停止后续分发与重绘。
+	if atomic.LoadInt32(&w.closed) != 0 {
+		return
+	}
 	if w.rootComponent != nil {
 		if w.rootComponent.OnEvent(evt) {
-			w.renderRoot()
+			if atomic.LoadInt32(&w.closed) == 0 {
+				w.renderRoot()
+			}
 		}
+	}
+	if atomic.LoadInt32(&w.closed) != 0 {
+		return
 	}
 	// 组合输入过程中光标会随预编辑串移动，需同步候选窗口位置
 	if w.imeComposing {
@@ -540,7 +553,7 @@ func findImeAnchor(c component.Component) (x, y, h int32, ok bool) {
 
 // renderRoot 渲染根组件到画布并刷新至屏幕
 func (w *Window) renderRoot() {
-	if w.renderer == nil {
+	if w.renderer == nil || atomic.LoadInt32(&w.closed) != 0 {
 		return
 	}
 	atomic.AddInt64(&w.renderCount, 1)
@@ -562,7 +575,7 @@ func (w *Window) renderRoot() {
 // renderRegion 只重新光栅化并投递指定矩形。
 // 用于光标闪烁：清背景、绘制组件树、BitBlt 全部被裁剪在该矩形内。
 func (w *Window) renderRegion(rect graphics.Rect) {
-	if w.renderer == nil || w.rootComponent == nil {
+	if w.renderer == nil || w.rootComponent == nil || atomic.LoadInt32(&w.closed) != 0 {
 		return
 	}
 	client := graphics.NewRect(0, 0, w.clientWidth, w.clientHeight)

@@ -5,6 +5,7 @@ package window
 import (
 	"testing"
 
+	"github.com/jacksalad/gnote/component"
 	"github.com/jacksalad/gnote/event"
 )
 
@@ -69,5 +70,31 @@ func TestWheelModifiersFromMessageBits(t *testing.T) {
 		if ctrl != tc.ctrl || shift != tc.shift {
 			t.Fatalf("wheelModifiers(%#x) = ctrl:%v shift:%v, want %v/%v", tc.wParam, ctrl, shift, tc.ctrl, tc.shift)
 		}
+	}
+}
+
+// TestWindow_CloseInsideEventHandler 回归：组件事件回调中关闭窗口（设置页“取消”、
+// Esc、文件菜单“退出”）后，事件分发不得继续重绘已释放的渲染目标。
+func TestWindow_CloseInsideEventHandler(t *testing.T) {
+	w, err := NewWindow(WindowConfig{Title: "close-in-event", Width: 240, Height: 160, Visible: false})
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	defer w.Destroy()
+
+	panel := component.NewPanel()
+	btn := component.NewButton("close")
+	btn.SetBounds(10, 10, 100, 40)
+	btn.OnClick(func() { w.Close() })
+	panel.Add(btn)
+	panel.SetBounds(0, 0, 240, 160)
+	w.SetContent(panel)
+
+	lParam := uintptr(20 | 20<<16)
+	w.handleMessage(w.hwnd, WM_LBUTTONDOWN, 0, lParam)
+	w.handleMessage(w.hwnd, WM_LBUTTONUP, 0, lParam)
+
+	if IsWindow(w.hwnd) {
+		t.Fatalf("window should be destroyed by the click handler")
 	}
 }
