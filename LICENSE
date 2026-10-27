@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-party notice:
-
-cmd/gnote/font.ttf is a subset/merged derivative of Maple Mono CN and
-LXGW WenKai Mono, distributed under the SIL Open Font License 1.1.
-See cmd/gnote/font-LICENSE.txt for the full text and attribution.
