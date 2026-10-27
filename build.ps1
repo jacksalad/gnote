@@ -121,7 +121,7 @@ If Windows Defender SmartScreen warns about an unrecognized app:
 "@
     [System.IO.File]::WriteAllText("$pkgDir/README.txt", $readmeText, [System.Text.Encoding]::UTF8)
 
-    $zipPath = "bin/gnote-v4.0.0-windows-amd64.zip"
+    $zipPath = "bin/gnote-v1.0.0-windows-amd64.zip"
     if (Test-Path $zipPath) {
         Remove-Item -Force $zipPath
     }

@@ -339,7 +339,7 @@ func (sw *settingsWindow) buildAboutPage(titleFont, labelFont, smallFont *goui.F
 		y     int32
 		color bool
 	}{
-		{"gnote 4.0", labelFont, sw.px(72), false},
+		{"gnote " + appVersion, labelFont, sw.px(72), false},
 		{"纯 Go · 零 CGO · 软件光栅化渲染", smallFont, sw.px(108), true},
 		{"16 种语言语法高亮 · 内嵌中英文字体", smallFont, sw.px(136), true},
 		{"https://github.com/jacksalad/gnote", smallFont, sw.px(176), true},

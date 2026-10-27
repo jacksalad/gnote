@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="jacksalad.gnote"
-      version="4.0.0.0"
+      version="1.0.0.0"
       processorArchitecture="*"
   />
   <description>gnote 记事本与代码编辑器</description>
