@@ -54,6 +54,7 @@ gnote/
 ├── render/                   # 纯 Go 软件光栅化渲染引擎
 │   ├── canvas.go             # Canvas 像素缓冲区、剪裁栈、直线/圆角/矩形光栅化与脏标记
 │   ├── font.go               # GDI 矢量字体轮廓提取 (GetGlyphOutlineW) 与抗锯齿像素混合
+│   ├── glyphcache.go         # 字形 AlphaMask 磁盘缓存（字体指纹/键/版本校验、原子写入）
 │   ├── image.go              # 纯 Go 像素图像抽象与解码器集成 (PNG/JPEG/GIF)
 │   └── renderer.go           # SoftwareRenderer 抽象与生命周期管理
 ├── syntax/                   # 纯 Go 词法分词与 16 种语言语法高亮引擎
@@ -145,6 +146,10 @@ gnote/
 - **智能缩进**：回车自动复制当前行前导空白，前一个非空字符为 `{` 时额外缩进一级；`Shift+Tab` 对当前行或选区覆盖的所有行反缩进（单步撤销）；`Ctrl+Backspace` / `Ctrl+Delete` 删除单词，`Ctrl+←/→` 单词跳转，`Ctrl+Home/End` 文档首尾；
 - **输入法 (IME)**：拦截 `WM_IME_*`，组合串在光标处内联绘制（下划线 + 背景，后续文本整体右移），`ImmSetCompositionWindow` / `ImmSetCandidateWindow` 将组合窗口与候选列表贴靠真实光标；屏蔽系统默认组合窗口避免重影；
 - **高亮挂载与文件嗅探**：打开或保存文件时，根据文件后缀名自动通过 `syntax.DetectHighlighter` 嗅探最佳语言词法解析器。
+- **两阶段启动显示 (Two-phase Show)**：窗口以隐藏状态创建（`Visible: false`），设置读取、界面构建、布局与首帧光栅化全部完成后才 `Window.Show()`；`Show` 先渲染后备缓冲再 `ShowWindow`，首次出现即带完整内容，消除空窗闪烁；隐藏窗口期间 `SetContent` / `SetTheme` / `RequestRedraw` 只更新组件树不出帧，避免重复整帧渲染；
+- **并行字体注册**：`main` 中 6.5MB 内嵌字体通过 `AddFontMemResourceEx` 注册放到 goroutine，与设置读取、图标生成、窗口创建并行，在构建 UI 前汇合，隐藏约 10–30ms 的字体装载耗时；
+- **字形磁盘缓存 (Persistent Glyph Cache)**：`render/glyphcache.go` 把已光栅化的字形 AlphaMask 按「字体指纹 + 字号/粗体/斜体/AlignSpace」落盘到 `%LOCALAPPDATA%/gnote/glyphcache/`，进程退出时由 `SaveGlyphCaches()` 原子写入；下次启动首帧直接反序列化（~5ms），冷启动需按需光栅化的数百个字形（~60ms）只在新字体/新字号首次出现时支付；缓存带版本号、字体指纹、键校验与尺寸/截断校验，损坏文件自动忽略并回退；
+- **启动热路径零磁盘写**：应用图标只在内存中光栅生成，`.ico` 资产由构建脚本生成，启动不再 `os.Stat`/写盘（也避免触发实时防病毒扫描）。
 
 ### 3.2 自绘菜单栏与状态联动 (`cmd/gnote/app.go` & `component/menubar.go`)
 - **顶部菜单栏**：全客户区自绘 `MenuLayer`，文件/编辑/查看/设置/帮助五个菜单，查看菜单内嵌“主题”子菜单（八套主题单选勾选），支持一级子菜单、Alt+字母、F10、方向键、Esc、点击外部关闭与窄窗口翻转；菜单状态每次打开都从命令注册表重建，撤销/重做置灰与行号/换行/高亮/主题勾选实时生效；
@@ -184,6 +189,8 @@ gnote/
 | 连续单字符输入 | 每键 1–2 allocs | **0 allocs / 26 B** |
 | 新建 + 装载 + 首帧 | 27.9 ms / 54.0 MB / 158 allocs | **24.5 ms / 37.4 MB / 52 allocs** |
 
+> **启动耗时（同机 release 构建，中位数）**：优化前窗口先以空白出现（约 62ms）、首帧内容约 135ms 后才可读；优化后热启动（字形缓存命中）窗口带完整内容出现约 **68ms**，无缓存首次运行约 140–175ms。字体注册与设置/窗口创建并行，首帧不再有多余空帧与焦点重绘。
+
 > 剩余大项（装载/缩放/全部替换/撤销回放）与 v4.1 结构性计划见 `docs/v4-roadmap.md`。
 
 ---
@@ -197,6 +204,7 @@ gnote/
 | **菜单与设置** | `MenuBar`, `Switch`, `Segmented`, `TabBar` | `NewMenuBar()`, `NewSwitch()`, `NewSegmented()`, `NewTabBar()` | 自绘菜单、设置分组导航与开关/分段选择控件 |
 | **应用图标** | `Icon`, `HICON` | `GetGnoteIcon()`, `EnsureGnoteICOFile()` | 纯 Go 光栅生成极简专属图标，支持 ICO 导出与 Windows 原生句柄绑定 |
 | **文本编辑** | `TextArea` | `NewTextArea()`, `FindNext()`, `ReplaceAll()`, `ReplaceDocument()`, `ImeAnchor()` | 多行文本编辑、自动折行、行号槽、高亮器接入、查找替换、整篇替换与 IME 组合串/光标锚点 |
+| **字形缓存** | `Glyph`, `FontFace` | `SaveGlyphCaches()`, `RegisterMemoryFont()` | 已光栅化字形 AlphaMask 按字体指纹/字号落盘并跨进程复用 |
 | **文档格式化** | `format.Kind` | `KindForPath()`, `Format()`, `FormatJSON()`, `FormatHTML()` | JSON token 级缩进（键序/数字字面量不变）与 HTML 块级排版（pre/script/style/textarea 原文保留） |
 | **高亮体系** | `Highlighter`, `Span` | `DetectHighlighter()`, `GetLanguageName()` | 16 种编程语言的纯 Go 状态机词法分词与样式生成 |
 | **系统窗口** | `Window`, `WindowConfig` | `NewWindow()`, `SetOnClose()`, `Activate()`, `Run()` | 零 CGO 窗口创建、DIBSection 双缓冲、owner/modal、系统键分发与退出拦截 |

@@ -98,6 +98,8 @@ type FontFace struct {
 	Height  int32
 	Descent int32
 	cache   map[rune]*Glyph
+	// cacheID 非空时该字体面参与磁盘字形缓存（仅内嵌内存字体）。
+	cacheID string
 	// spaceGlyph 非 nil 时 ' ' 使用固定步进（Font.AlignSpace），
 	// 在字体面创建完成后写入且不再变更，读取无需加锁。
 	spaceGlyph *Glyph
@@ -286,12 +288,20 @@ func (fm *FontManager) GetFace(font *graphics.Font) *FontFace {
 	getTextMetricsWProc.Call(fm.hdc, uintptr(unsafe.Pointer(&tm)))
 	selectObjectProc.Call(fm.hdc, oldFont)
 
+	fontSizeResolved := font.Size
+	if fontSizeResolved <= 0 {
+		fontSizeResolved = 14
+	}
 	face = &FontFace{
 		hFont:   hFont,
 		Ascent:  tm.Ascent,
 		Height:  tm.Height,
 		Descent: tm.Descent,
 		cache:   make(map[rune]*Glyph),
+	}
+	if id, ok := memoryFontID(font.Name); ok {
+		face.cacheID = glyphCacheKey(id, fontSizeResolved, font.Bold, font.Italic, font.AlignSpace)
+		loadGlyphCache(face)
 	}
 	if font.AlignSpace {
 		// 比例字体的原生空格通常只有约 0.25em（约为普通字母的一半），代码缩进会明显偏窄。
@@ -730,6 +740,8 @@ func RegisterMemoryFont(fontData []byte) (string, error) {
 	registeredMemFonts = append(registeredMemFonts, hFontRes)
 	registeredMemFontsMu.Unlock()
 
+	rememberMemoryFont(familyName, fontData)
+
 	return familyName, nil
 }
 
@@ -756,6 +768,8 @@ func RegisterMemoryFontWithName(fontData []byte, name string) (string, error) {
 	registeredMemFontsMu.Lock()
 	registeredMemFonts = append(registeredMemFonts, hFontRes)
 	registeredMemFontsMu.Unlock()
+
+	rememberMemoryFont(name, fontData)
 
 	return name, nil
 }

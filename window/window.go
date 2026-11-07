@@ -620,7 +620,11 @@ func (w *Window) SetContent(c component.Component) {
 			p.DoLayout()
 		}
 	}
-	w.renderRoot()
+	// 隐藏窗口（启动期两阶段显示、设置窗口）不在这里出帧：Show 会统一渲染一次，
+	// 避免空窗闪烁与重复整帧光栅化。
+	if w.IsVisible() {
+		w.renderRoot()
+	}
 }
 
 // GetContent 获取窗口的根组件
@@ -659,7 +663,7 @@ func (w *Window) SetTheme(t *theme.Theme) {
 			th.ApplyTheme(t)
 		}
 	}
-	w.renderRoot()
+	w.RequestRedraw()
 }
 
 // ApplyThemeToAllWindows 将主题广播应用到当前所有已创建的系统窗口
@@ -1129,6 +1133,11 @@ func (w *Window) cleanup() {
 	windowMapMu.Unlock()
 }
 
+// IsVisible 报告窗口当前是否可见（最小化仍视为可见）。
+func (w *Window) IsVisible() bool {
+	return w.hwnd != 0 && IsWindowVisible(w.hwnd)
+}
+
 // GetHandle 获取窗口句柄
 func (w *Window) GetHandle() uintptr {
 	return w.hwnd
@@ -1283,9 +1292,10 @@ func (w *Window) SetPosition(x, y int32) {
 // 创建成功但未被显示（例如构建中途失败或用户取消）不会让主窗口失去响应。
 func (w *Window) Show() {
 	w.disableOwnerForModal()
+	// 先在后备缓冲里准备好最终一帧，再显示窗口：首次出现即带内容，无空白闪烁。
+	w.renderRoot()
 	ShowWindow(w.hwnd, SW_SHOW)
 	UpdateWindow(w.hwnd)
-	w.renderRoot()
 }
 
 // disableOwnerForModal 在模态子窗口首次显示时禁用 owner 并登记计数。
@@ -1433,15 +1443,27 @@ func (w *Window) rememberFocus() {
 
 // restoreFocus 恢复窗口失焦前的焦点组件；组件已不可用时回退到第一个可聚焦组件。
 func (w *Window) restoreFocus() {
+	type focusable interface {
+		SetFocused(bool)
+		IsFocused() bool
+	}
 	if c := w.lastFocused; c != nil && c.IsVisible() && c.IsEnabled() {
-		if f, ok := c.(interface{ SetFocused(bool) }); ok {
+		if f, ok := c.(focusable); ok {
+			// 已经是焦点组件时无需重绘：窗口激活会随后触发 WM_PAINT 复用后备缓冲，
+			// 启动阶段还能省掉一次整帧光栅化。
+			if f.IsFocused() {
+				return
+			}
 			f.SetFocused(true)
 			w.renderRoot()
 			return
 		}
 	}
 	if c := findFirstFocusable(w.rootComponent); c != nil {
-		if f, ok := c.(interface{ SetFocused(bool) }); ok {
+		if f, ok := c.(focusable); ok {
+			if f.IsFocused() {
+				return
+			}
 			f.SetFocused(true)
 			w.lastFocused = c
 			w.renderRoot()
@@ -1551,6 +1573,10 @@ func (w *Window) Stop() {
 // 通过 WM_APP_REDRAW 把渲染封送到 UI 线程，绝不跨线程写画布/DIB。
 func (w *Window) RequestRedraw() {
 	if w.hwnd == 0 || atomic.LoadInt32(&w.closed) == 1 {
+		return
+	}
+	// 隐藏窗口不渲染：Show 会以最新组件树完整出帧一次。
+	if !w.IsVisible() {
 		return
 	}
 	if GetCurrentThreadID() == atomic.LoadUint32(&w.uiThreadID) {

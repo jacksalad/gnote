@@ -16,15 +16,21 @@ import (
 var embeddedFontData []byte
 
 func main() {
-	// 0. 优先加载并注册内嵌的等宽中英文字体 (6.5MB, 9431 码位, 中英严格 2:1, 零外部依赖)
+	// 0. 内嵌字体注册（6.5MB / 9431 码位）与设置读取、图标生成、窗口创建互不依赖：
+	// 放到 goroutine 并行执行，只在构建 UI 之前汇合，隐藏约 10–30ms 的字体装载耗时。
 	appFontFamily := "Microsoft YaHei"
-	if len(embeddedFontData) > 0 {
-		fam, err := goui.RegisterMemoryFont(embeddedFontData)
-		if err == nil && fam != "" {
-			appFontFamily = fam
-			goui.SetDefaultFont(appFontFamily, 16)
+	fontReady := make(chan string, 1)
+	go func() {
+		if len(embeddedFontData) == 0 {
+			fontReady <- ""
+			return
 		}
-	}
+		fam, err := goui.RegisterMemoryFont(embeddedFontData)
+		if err != nil {
+			fam = ""
+		}
+		fontReady <- fam
+	}()
 
 	// 1. 读取用户偏好并先应用主题，保证窗口创建时就是正确的背景色
 	settings := LoadSettings()
@@ -43,14 +49,18 @@ func main() {
 		Center:    true,
 		Icon:      gnoteIcon,
 		Resizable: true,
-		Visible:   true,
+		Visible:   false,
 	})
 	if err != nil {
 		fmt.Printf("创建窗口失败: %v\n", err)
 		return
 	}
 
-	// 3. 构建应用状态、界面与命令，进入主消息循环
+	// 3. 汇合并行字体注册，构建应用状态、界面与命令，进入主消息循环
+	if fam := <-fontReady; fam != "" {
+		appFontFamily = fam
+		goui.SetDefaultFont(appFontFamily, 16)
+	}
 	app := NewApp(win, appFontFamily, settings)
 	app.Build()
 	app.Start(parseTargetFileFromArgs(os.Args[1:]), welcomeDoc)

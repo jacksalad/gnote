@@ -148,14 +148,24 @@ func (a *App) Start(initialTarget, welcomeDoc string) {
 	a.textArea.SetFocused(true)
 
 	a.win.SetContent(a.root)
+	// SetContent 会清空 lastFocused，必须在挂载之后再登记：
+	// 窗口激活时 restoreFocus 直接复用该焦点，不再整帧重绘。
+	a.win.SetLastFocused(a.textArea)
 	a.updateLayout()
 	a.UpdateHeaderAndStatus()
-	a.win.RequestRedraw()
+	if a.win.IsVisible() {
+		a.win.RequestRedraw()
+	} else {
+		// 两阶段显示：内容与布局全部就绪后再显示窗口，首次出现即完整可交互。
+		a.win.Show()
+	}
 
 	// 注册窗口直接关闭拦截钩子（未保存修改提示确认），关闭成功后保存偏好。
 	a.win.SetOnClose(a.handleClose)
 
 	a.win.Run()
+	// 消息循环结束后把字形缓存落盘；下次启动首帧直接复用。
+	goui.SaveGlyphCaches()
 }
 
 // showStartupDocument 按设置打开介绍文档或空白页。

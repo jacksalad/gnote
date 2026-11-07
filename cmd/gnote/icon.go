@@ -22,13 +22,7 @@ func GetGnoteIcon() *goui.Icon {
 		return nil
 	}
 
-	// 确保本地存在标准 .ico 资产文件，方便用户部署或 PE 编译
-	icoTarget := "icon.ico"
-	if _, err := os.Stat("cmd/gnote/icon.ico"); err == nil {
-		icoTarget = "cmd/gnote/icon.ico"
-	}
-	_ = EnsureGnoteICOFile(icoTarget)
-
+	// 仅生成内存图标；.ico 资产由构建脚本/工具生成，绝不在启动热路径写盘。
 	return icon
 }
 

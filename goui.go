@@ -229,6 +229,12 @@ func RegisterMemoryFontWithName(fontData []byte, name string) (string, error) {
 	return render.RegisterMemoryFontWithName(fontData, name)
 }
 
+// SaveGlyphCaches 把本次会话已光栅化的字形写入磁盘缓存，供下次启动直接复用。
+// 未调用或失败均不影响功能，只是下次启动需要重新光栅化。
+func SaveGlyphCaches() {
+	render.SaveGlyphCaches()
+}
+
 // SetDefaultFont 设置全局默认字体规格。
 // 原地更新 graphics.DefaultFont，component/goui 暴露的默认字体别名随即可见。
 func SetDefaultFont(family string, size int32) {
