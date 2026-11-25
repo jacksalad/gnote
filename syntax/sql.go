@@ -317,10 +317,11 @@ func (h *SQLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 			continue
 		}
 
-		// 2.8 标识符与关键字 (大小写不敏感匹配)
+		// 2.8 标识符与关键字 (大小写不敏感匹配)；'@' 属于 T-SQL / MySQL 的变量名
+		// (@id、@@VERSION)，续扫必须一并接受，否则 i 停在 '@' 上永不前进
 		if unicode.IsLetter(r) || r == '_' || r == '@' {
 			start := i
-			for i < n && (unicode.IsLetter(line[i]) || unicode.IsDigit(line[i]) || line[i] == '_') {
+			for i < n && (unicode.IsLetter(line[i]) || unicode.IsDigit(line[i]) || line[i] == '_' || line[i] == '@') {
 				i++
 			}
 			word := strings.ToLower(string(line[start:i]))

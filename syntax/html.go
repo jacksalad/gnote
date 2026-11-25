@@ -371,6 +371,11 @@ func (h *HTMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 		for i < n && line[i] != '<' && line[i] != '&' {
 			i++
 		}
+		// 游离的 '<'（后面不是标签名、'/'、'!'）不是任何标签的起点：按正文消费，
+		// 否则扫描停在它上面不前进，整个循环死转。
+		if i == textStart && i < n && line[i] == '<' {
+			i++
+		}
 		if i > textStart {
 			spans = append(spans, Span{
 				StartCol: textStart,

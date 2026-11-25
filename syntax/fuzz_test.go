@@ -50,6 +50,11 @@ func FuzzHighlightLine(f *testing.F) {
 	for _, s := range seeds {
 		f.Add(s, uint8(0), 0)
 	}
+	// 回归种子：曾分别让 SQL / HTML / Markdown 高亮器死循环的最小输入（见 termination_test.go）。
+	// langSel 按 allHighlighters 的顺序取模，11 / 9 / 12 依次对应这三种语言。
+	f.Add("@", uint8(11), 0)
+	f.Add("<", uint8(9), 0)
+	f.Add(">*", uint8(12), 0)
 
 	f.Fuzz(func(t *testing.T, text string, langSel uint8, prev int) {
 		if prev < 0 {

@@ -632,19 +632,22 @@ func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultC
 			}
 		}
 
-		// 普通未匹配字符：如果指定了默认颜色（如引用块内文字），可以向前聚合
+		// 普通未匹配字符：如果指定了默认颜色（如引用块内文字），可以向前聚合。
+		// 落单的标记字符（引用块里没配对的 '*'、'['、反引号等）没被上方规则消费，
+		// 聚合循环停在它上面；必须按普通文字前进一格，否则整个循环死转。
 		if defaultColor != 0 {
 			segStart := i
 			for i < end && line[i] != '`' && line[i] != '*' && line[i] != '_' && line[i] != '[' && line[i] != '!' && line[i] != '<' && line[i] != '~' {
 				i++
 			}
-			if i > segStart {
-				spans = append(spans, Span{
-					StartCol: segStart,
-					EndCol:   i,
-					Color:    defaultColor,
-				})
+			if i == segStart {
+				i++
 			}
+			spans = append(spans, Span{
+				StartCol: segStart,
+				EndCol:   i,
+				Color:    defaultColor,
+			})
 			continue
 		}
 
