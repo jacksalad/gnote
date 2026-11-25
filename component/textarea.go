@@ -399,15 +399,17 @@ func (t *TextArea) moveGap(pos int) {
 	t.gapStart, t.gapEnd = pos, pos+g
 }
 
-// growGap 扩充间隙容量，保留逻辑内容不变
+// growGap 扩充间隙容量，保留逻辑内容不变。
+// need 是相对当前间隙的缺口量，扩充后间隙至少为 g+need；直接取 need 会让
+// 大块插入（单次超过 max(2g, 4096) 个 rune）后的间隙反转，下一次取行视图即 panic。
 func (t *TextArea) growGap(need int) {
 	g := t.gapEnd - t.gapStart
 	newGap := g * 2
 	if newGap < 4096 {
 		newGap = 4096
 	}
-	if newGap < need {
-		newGap = need
+	if newGap < g+need {
+		newGap = g + need
 	}
 	n := t.logicalLen()
 	buf := make([]rune, n+newGap)
