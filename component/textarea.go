@@ -1828,6 +1828,10 @@ func (t *TextArea) finishReplaceAll(rec editRecord, count, firstRow, firstCol in
 
 	t.revision = rec.revAfter
 	t.modified = true
+	// 全部替换是独立的撤销步骤：重置合组状态，否则随后的单字符删除会按过期的
+	// lastEditKind 并入这条替换记录，removed/inserted 不再自洽（撤销丢字、重做越界）
+	t.lastEditKind = 0
+	t.lastEditAt = time.Time{}
 
 	t.invalidateHighlightFrom(firstRow)
 	t.clampScroll()
@@ -2670,6 +2674,7 @@ func (t *TextArea) tryMergeUndo(kind, row, col int, inserted, removed []rune, af
 		}
 	case 2: // 连续退格
 		if len(removed) == 1 && removed[0] != '\n' && len(inserted) == 0 &&
+			len(last.inserted) == 0 &&
 			len(last.removed) > 0 && len(last.removed) < 512 &&
 			last.removed[0] != '\n' &&
 			col+1 == last.col {
@@ -2679,6 +2684,7 @@ func (t *TextArea) tryMergeUndo(kind, row, col int, inserted, removed []rune, af
 		}
 	case 3: // 连续 Delete
 		if len(removed) == 1 && removed[0] != '\n' && len(inserted) == 0 &&
+			len(last.inserted) == 0 &&
 			len(last.removed) > 0 && len(last.removed) < 512 &&
 			col == last.col {
 			last.removed = append(last.removed, removed[0])

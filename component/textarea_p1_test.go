@@ -3,6 +3,7 @@ package component
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jacksalad/gnote/event"
 	"github.com/jacksalad/gnote/graphics"
@@ -76,6 +77,84 @@ func TestTextArea_CursorMoveBreaksMerge(t *testing.T) {
 	ta.Undo()
 	if got := ta.GetText(); got != "a" {
 		t.Fatalf("undo after break = %q", got)
+	}
+}
+
+// 回归：全部替换只命中一处时，栈顶是单条 op 的替换记录，但 finishReplaceAll 曾不重置
+// 撤销合组状态；随后的 Delete 按过期的 lastEditKind 把被删字符追加进这条记录的 removed，
+// 记录不再自洽（removed="QX" inserted="XY"）：撤销丢字，连续删除后撤销/重做还会越界 panic。
+func TestTextArea_ReplaceAllBreaksUndoMerge(t *testing.T) {
+	ta := newTestTextArea("ZaQ")
+	pressKey(ta, 0x2E, false, false) // Delete：合组状态变为“连续 Delete”
+	if n := ta.ReplaceAll("Q", "XY", true); n != 1 {
+		t.Fatalf("expected 1 replacement, got %d", n)
+	}
+	for range 2 {
+		pressKey(ta, 0x2E, false, false)
+	}
+	if got, want := ta.GetText(), "a"; got != want {
+		t.Fatalf("after replace all + deletes = %q want %q", got, want)
+	}
+	// Delete、全部替换、随后的两次 Delete（合并为一步）
+	if got, want := len(ta.undoStack), 3; got != want {
+		t.Fatalf("undo records = %d want %d: replace all must break the delete merge", got, want)
+	}
+
+	// 落定行宽缓存后撤销/重做走已测量的快路径，正是越界记录 panic 的路径
+	ta.Render(render.NewCanvas(800, 600))
+	for i, want := range []string{"aXY", "aQ", "ZaQ"} {
+		if !ta.Undo() {
+			t.Fatalf("undo %d failed", i)
+		}
+		if got := ta.GetText(); got != want {
+			t.Fatalf("undo %d = %q want %q", i, got, want)
+		}
+	}
+	for i, want := range []string{"aQ", "aXY", "a"} {
+		if !ta.Redo() {
+			t.Fatalf("redo %d failed", i)
+		}
+		if got := ta.GetText(); got != want {
+			t.Fatalf("redo %d = %q want %q", i, got, want)
+		}
+	}
+}
+
+// 纵使合组状态被弄脏（过期的 lastEditKind），单字符删除也不得并入带 inserted 文本的记录。
+func TestTextArea_DeleteNeverMergesIntoReplaceRecord(t *testing.T) {
+	for _, kind := range []int{2, 3} { // 2 退格、3 Delete
+		ta := newTestTextArea("aQb")
+		if n := ta.ReplaceAll("Q", "XY", true); n != 1 {
+			t.Fatalf("expected 1 replacement, got %d", n)
+		}
+		// 模拟过期的合组状态：全部替换把光标留在替换结果的首列，在此处按 Delete 或退格
+		// 都满足列邻接条件（col == last.col / col+1 == last.col）
+		ta.lastEditKind = kind
+		ta.lastEditAt = time.Now()
+		code := 0x2E
+		want := "aYb" // Delete 删掉替换结果的首字符
+		if kind == 2 {
+			code = 0x08
+			want = "XYb" // 退格删掉替换结果之前紧邻的那个字符
+		}
+		pressKey(ta, code, false, false)
+		if got := ta.GetText(); got != want {
+			t.Fatalf("kind %d: after key = %q want %q", kind, got, want)
+		}
+		if got, wantRecords := len(ta.undoStack), 2; got != wantRecords {
+			t.Fatalf("kind %d: undo records = %d want %d: delete merged into a replace record", kind, got, wantRecords)
+		}
+
+		ta.Render(render.NewCanvas(800, 600))
+		if !ta.Undo() || ta.GetText() != "aXYb" {
+			t.Fatalf("kind %d: undo = %q want %q", kind, ta.GetText(), "aXYb")
+		}
+		if !ta.Undo() || ta.GetText() != "aQb" {
+			t.Fatalf("kind %d: second undo = %q want %q", kind, ta.GetText(), "aQb")
+		}
+		if !ta.Redo() || ta.GetText() != "aXYb" || !ta.Redo() || ta.GetText() != want {
+			t.Fatalf("kind %d: redo round trip = %q want %q", kind, ta.GetText(), want)
+		}
 	}
 }
 
