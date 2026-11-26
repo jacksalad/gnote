@@ -103,7 +103,12 @@ type FontFace struct {
 	// spaceGlyph 非 nil 时 ' ' 使用固定步进（Font.AlignSpace），
 	// 在字体面创建完成后写入且不再变更，读取无需加锁。
 	spaceGlyph *Glyph
-	mu         sync.RWMutex
+	// base 非 nil 时本字体面是 GDI 合成的粗体（字族没有真实粗体字面），
+	// 所有字形沿用 base（同字号常规/斜体字面）的步进；创建后只读。
+	// 合成加粗会让每个字形宽 1px，而编辑器的折行、行宽与滚动上界按常规字面计算，
+	// 不归一的话粗体行会越过折行上限、行尾滚不进视口、光标与命中逐字偏移。
+	base *FontFace
+	mu   sync.RWMutex
 }
 
 // maxGlyphsPerFace 单个字体面的字形缓存上限，防止超大字符集下无界增长
@@ -168,6 +173,7 @@ func (f *FontFace) GetGlyph(r rune, hdc uintptr) *Glyph {
 		glyph := &Glyph{
 			CellIncX: adv,
 		}
+		f.pinAdvance(r, glyph, hdc)
 		f.storeGlyph(r, glyph)
 		return glyph
 	}
@@ -198,8 +204,31 @@ func (f *FontFace) GetGlyph(r rune, hdc uintptr) *Glyph {
 	}
 	glyph.AlphaMask = mask
 
+	f.pinAdvance(r, glyph, hdc)
 	f.storeGlyph(r, glyph)
 	return glyph
+}
+
+// pinAdvance 合成粗体字形沿用常规字面的步进。只改步进：位图仍是加粗后的字形，
+// 墨迹可能越过本格 1px，但不得推移后续字形。常规命中路径不经过这里。
+func (f *FontFace) pinAdvance(r rune, glyph *Glyph, hdc uintptr) {
+	if f.base != nil {
+		glyph.CellIncX = f.base.GetGlyph(r, hdc).CellIncX
+	}
+}
+
+// syntheticBold 判断 GDI 是否为 face 合成了粗体。字族没有真实粗体字面时，
+// GDI 把常规字形加粗，并让每个字形的步进恰好比常规字面宽 1px；
+// 有真实粗体字面的等宽字族步进与常规一致，不会命中。
+// 用窄字母、宽字母、数字各探一个，避免比例字体的真实粗体面在小字号下被误判。
+func syntheticBold(face, base *FontFace, hdc uintptr) bool {
+	for _, r := range [...]rune{'i', 'W', '0'} {
+		regular := base.GetGlyph(r, hdc).CellIncX
+		if regular <= 0 || face.GetGlyph(r, hdc).CellIncX != regular+1 {
+			return false
+		}
+	}
+	return true
 }
 
 // fontKey 字体缓存键（避免每次测量都做字符串拼接）
@@ -248,6 +277,12 @@ func (fm *FontManager) GetFace(font *graphics.Font) *FontFace {
 	fm.mu.RUnlock()
 	if ok {
 		return face
+	}
+
+	// 合成粗体检测需要同字号的常规字面，而 GetFace 不可重入：必须在加写锁之前取得
+	var base *FontFace
+	if font.Bold && font.AlignSpace {
+		base = fm.GetFace(&graphics.Font{Name: font.Name, Size: font.Size, Italic: font.Italic, AlignSpace: font.AlignSpace})
 	}
 
 	fm.mu.Lock()
@@ -302,6 +337,14 @@ func (fm *FontManager) GetFace(font *graphics.Font) *FontFace {
 	if id, ok := memoryFontID(font.Name); ok {
 		face.cacheID = glyphCacheKey(id, fontSizeResolved, font.Bold, font.Italic, font.AlignSpace)
 		loadGlyphCache(face)
+	}
+	if base != nil && syntheticBold(face, base, fm.hdc) {
+		// 仅编辑器字体（AlignSpace）归一步进，普通 UI 文本保持 GDI 原生排版；
+		// 旧版本写出的磁盘缓存仍带着 +1 步进，一并归一
+		face.base = base
+		for r, g := range face.cache {
+			g.CellIncX = base.GetGlyph(r, fm.hdc).CellIncX
+		}
 	}
 	if font.AlignSpace {
 		// 比例字体的原生空格通常只有约 0.25em（约为普通字母的一半），代码缩进会明显偏窄。

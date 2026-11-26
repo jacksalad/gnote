@@ -51,7 +51,7 @@ func TestCanvasMultilineFontEngine(t *testing.T) {
 }
 
 func TestRegisterMemoryFont(t *testing.T) {
-	data, err := os.ReadFile("../examples/notepad/font.ttf")
+	data, err := os.ReadFile("../cmd/gnote/font.ttf")
 	if err != nil {
 		t.Skipf("skipping TestRegisterMemoryFont, font.ttf not found: %v", err)
 	}
@@ -60,8 +60,8 @@ func TestRegisterMemoryFont(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractFontFamily failed: %v", err)
 	}
-	if family != "yyb" {
-		t.Errorf("expected family 'yyb', got '%s'", family)
+	if family != "Gnote Mono" {
+		t.Errorf("expected family 'Gnote Mono', got '%s'", family)
 	}
 
 	registeredFamily, err := render.RegisterMemoryFont(data)

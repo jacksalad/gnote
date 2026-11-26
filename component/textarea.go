@@ -192,6 +192,10 @@ type TextArea struct {
 	// 输入法预编辑串（组合中的文本，仅参与绘制，不进入文档）
 	preedit string
 
+	// 系统剪贴板写入实现（默认 clipboard.SetText）；Cut 依据它的结果决定是否删除选区。
+	// 可替换以便在不触碰真实剪贴板的情况下测试失败路径。
+	copyToClipboard func(text string) bool
+
 	// 多击检测（双击选词 / 三击选行）
 	lastClickAt  time.Time
 	lastClickRow int
@@ -255,6 +259,7 @@ func NewTextArea() *TextArea {
 		redoStack:           make([]editRecord, 0, 16),
 		spansCache:          make(map[int][]syntax.Span),
 		lineEnding:          "\r\n",
+		copyToClipboard:     clipboard.SetText,
 	}
 
 	t.ensureTextInitialized()
@@ -688,9 +693,17 @@ func (t *TextArea) invalidateHighlightForEdit(startRow, endRow, rowDelta int) {
 	if startRow > 0 {
 		state = t.lineStates[startRow-1]
 	}
+	// 单行编辑：这里为了拿到新的行尾状态已经把编辑行整行分词，得到的 spans 直接
+	// 留给随后的光标测量与绘制，避免超长高亮行上每键分词两次。
+	// 多行等行数替换不入缓存：行数可能很多，可见行留给绘制按需分词。
+	cacheSpans := startRow == endRow
 	for r := startRow; r <= endRow; r++ {
-		_, state = t.highlighter.HighlightLine(r, t.line(r), state)
+		var spans []syntax.Span
+		spans, state = t.highlighter.HighlightLine(r, t.line(r), state)
 		t.lineStates[r] = state
+		if cacheSpans {
+			t.storeSpans(r, spans)
+		}
 	}
 
 	if state == oldEnd {
@@ -719,13 +732,17 @@ func (t *TextArea) getSpansForLine(r int) []syntax.Span {
 		prevState = t.lineStates[r-1]
 	}
 	spans, _ := t.highlighter.HighlightLine(r, t.line(r), prevState)
-	// 缓存只服务于可见行：上限压到一个视口量级，既避免长会话堆积，
-	// 也让“从编辑行向下失效”的 map 扫描保持在微秒级。
+	t.storeSpans(r, spans)
+	return spans
+}
+
+// storeSpans 写入行级 span 缓存。缓存只服务于可见行：上限压到一个视口量级，
+// 既避免长会话堆积，也让“从编辑行向下失效”的 map 扫描保持在微秒级。
+func (t *TextArea) storeSpans(r int, spans []syntax.Span) {
 	if len(t.spansCache) > maxCachedSpanRows {
 		clear(t.spansCache)
 	}
 	t.spansCache[r] = spans
-	return spans
 }
 
 // spanFaceAt 返回列 col 使用的样式字体：span 有序时用单调游标，避免逐字符重扫。
@@ -1087,6 +1104,9 @@ func (t *TextArea) measureFontMetrics() {
 
 // lineFitsUpperBound 用等宽列数上界判断整行是否必然不需要折行。
 // 只做 rune 扫描，不查字形；返回 false 时调用方再走精确测量。
+// 上界必须只高不低：内嵌字体在 U+2000–U+2E7F 之间有两格的带圈数字、罗马数字、
+// 星号等字形，按 1 格计会让这类行被判定为放得下，实际画过了折行上限。
+// 高估只会让贴近上限的行退回精确测量。
 func (t *TextArea) lineFitsUpperBound(line []rune, availWidth int32) bool {
 	if !t.fontMonospace || t.monoWidth <= 0 || t.monoWideWidth <= 0 {
 		return false
@@ -1096,7 +1116,7 @@ func (t *TextArea) lineFitsUpperBound(line []rune, availWidth int32) bool {
 		switch {
 		case r == '	':
 			w += 4 * t.monoWidth
-		case r >= 0x2E80:
+		case r >= 0x2000:
 			w += t.monoWideWidth
 		default:
 			w += t.monoWidth
@@ -1589,7 +1609,30 @@ func (t *TextArea) ReplaceCurrentSelection(query, repl string, caseSensitive boo
 			return false
 		}
 	}
-	return t.applyEdit(sr, sc, er, ec, []rune(repl))
+	return t.applyEdit(sr, sc, er, ec, normalizeEOL([]rune(repl)))
+}
+
+// normalizeEOL 就地把 rune 切片中的 CRLF/CR 归一为 LF，返回收窄后的切片（文档内部只以 \n 分行）。
+// 替换文本来自 Windows 剪贴板时带 CRLF，不归一会把裸 CR 写进文档，CRLF 文件被保存成 \r\r\n。
+// 单遍前移写回，不新分配：返回值只是入参的子切片，[]rune(repl) 仍可按原样留在调用方栈上。
+func normalizeEOL(rs []rune) []rune {
+	w := 0
+	prevCR := false
+	for _, r := range rs {
+		switch {
+		case r == '\r':
+			rs[w] = '\n'
+			w++
+			prevCR = true
+		case r == '\n' && prevCR:
+			prevCR = false // CRLF 只保留一个换行
+		default:
+			rs[w] = r
+			w++
+			prevCR = false
+		}
+	}
+	return rs[:w]
 }
 
 // ReplaceAll 以字面量方式替换全部匹配，返回替换次数。
@@ -1606,7 +1649,7 @@ func (t *TextArea) ReplaceAll(query, repl string, caseSensitive bool) int {
 	}
 	t.clampCursor()
 
-	inserted := []rune(repl)
+	inserted := normalizeEOL([]rune(repl))
 	if runesContain(inserted, '\n') {
 		return t.replaceAllPerRow(q, inserted, caseSensitive)
 	}
@@ -1784,6 +1827,8 @@ func (t *TextArea) applyReplacePatches(patches []rowPatch, count, firstRow, firs
 		oldEnd := t.logicalToVisual[maxRow+1]
 		// 从后往前原地替换：较大行号的偏移先失效，较小行号的旧偏移仍有效
 		for _, p := range patches {
+			// 绕过了 replaceRange：超长行的宽度检查点必须在此手动失效
+			t.truncatePrefixForEdit(p.op.row, p.op.col, p.op.row, p.op.col)
 			startOff := t.lineStart[p.op.row] + p.op.col
 			t.replaceAt(startOff, len(p.op.removed), p.op.inserted)
 			t.layouts[p.row] = lineLayout{}
@@ -1949,7 +1994,8 @@ func (t *TextArea) SelectAll() {
 	t.notifyCursor()
 }
 
-// Copy 复制当前选区到系统剪贴板
+// Copy 复制当前选区到系统剪贴板，返回剪贴板写入是否成功。
+// 剪贴板被其他进程占用时 OpenClipboard 会失败，结果必须如实上报：Cut 依赖它决定是否删除。
 func (t *TextArea) Copy() bool {
 	if !t.selectionActive {
 		return false
@@ -1958,11 +2004,14 @@ func (t *TextArea) Copy() bool {
 	if text == "" {
 		return false
 	}
-	clipboard.SetText(text)
-	return true
+	setClipboard := t.copyToClipboard
+	if setClipboard == nil {
+		setClipboard = clipboard.SetText
+	}
+	return setClipboard(text)
 }
 
-// Cut 剪切当前选区
+// Cut 剪切当前选区（复制失败时保留文本，剪切不能变成纯删除）
 func (t *TextArea) Cut() bool {
 	if t.readOnly || !t.selectionActive {
 		return false

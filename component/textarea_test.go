@@ -249,7 +249,7 @@ func TestTextArea_WordWrap(t *testing.T) {
 }
 
 func TestTextArea_EmbeddedFontAlignment(t *testing.T) {
-	data, err := os.ReadFile("../examples/notepad/font.ttf")
+	data, err := os.ReadFile("../cmd/gnote/font.ttf")
 	if err != nil {
 		t.Skipf("skipping TestTextArea_EmbeddedFontAlignment, font.ttf not found: %v", err)
 	}
@@ -314,9 +314,11 @@ func TestTextArea_EmbeddedFontAlignment(t *testing.T) {
 		targetX := textStartX + ta.measureTextX(runes, i)
 		targetY := ta.bounds.Y + ta.margin + ta.lineHeight/2
 
+		// 未带按键的鼠标事件会被 OnEvent 丢弃，必须像 window 层一样填入左键
 		ta.OnEvent(event.NewEvent(event.EventMouseDown, event.MouseData{
-			X: targetX,
-			Y: targetY,
+			X:      targetX,
+			Y:      targetY,
+			Button: event.MouseButtonLeft,
 		}))
 
 		if ta.cursorCol != i {
@@ -350,7 +352,7 @@ func TestTextArea_EmbeddedFontAlignment(t *testing.T) {
 }
 
 func TestTextArea_MarkdownBoldAndInlineCodeAlignment(t *testing.T) {
-	data, err := os.ReadFile("../examples/notepad/font.ttf")
+	data, err := os.ReadFile("../cmd/gnote/font.ttf")
 	if err != nil {
 		t.Skip("font.ttf not found")
 	}
