@@ -1,6 +1,7 @@
 package component
 
 import (
+	"strings"
 	"time"
 
 	"github.com/jacksalad/gnote/clipboard"
@@ -29,6 +30,11 @@ type TextBox struct {
 	onChange         func(text string)
 	onSubmit         func(text string)
 	preedit          string // 输入法预编辑串（不进入文本模型）
+	keepLineBreaks   bool   // 是否保留文本里的换行（多行替换框），否则一律去掉
+
+	// readClipboard 返回剪贴板文本；nil 时读系统剪贴板。
+	// 测试注入它，避免改动用户的真实剪贴板。
+	readClipboard func() string
 }
 
 // NewTextBox 创建文本框
@@ -282,27 +288,14 @@ func (t *TextBox) handleKeyDown(data event.KeyData) bool {
 			}
 			return true
 		case 'V', 'v': // 粘贴
-			clipText := clipboard.GetText()
-			if clipText != "" {
-				if t.cursorPos > len(runes) {
-					t.cursorPos = len(runes)
-				}
-				// SetText 不受 maxLength 约束，maxLength 也可能被下调到小于既有文本；
-				// 此时 room <= 0，必须直接忽略粘贴，否则会切出负长度。
-				room := t.maxLength - len(runes)
-				if room <= 0 {
-					return true
-				}
-				clipRunes := []rune(clipText)
-				if len(clipRunes) > room {
-					clipRunes = clipRunes[:room]
-				}
-				newRunes := append(runes[:t.cursorPos], append(clipRunes, runes[t.cursorPos:]...)...)
-				t.text = string(newRunes)
-				t.cursorPos += len(clipRunes)
-				t.notifyChange()
-				return true
+			read := t.readClipboard
+			if read == nil {
+				read = clipboard.GetText
 			}
+			if clipText := read(); clipText != "" {
+				t.pasteText(clipText)
+			}
+			return true
 		}
 	}
 
@@ -352,6 +345,47 @@ func (t *TextBox) handleKeyDown(data event.KeyData) bool {
 	}
 
 	return false
+}
+
+// pasteText 在光标处插入一段剪贴板文本（Ctrl+V 分支；独立成方法便于不碰系统剪贴板地测试）。
+func (t *TextBox) pasteText(clipText string) {
+	runes := []rune(t.text)
+	if t.cursorPos > len(runes) {
+		t.cursorPos = len(runes)
+	}
+	clipRunes := []rune(t.normalizeInput(clipText))
+	// SetText 不受 maxLength 约束，maxLength 也可能被下调到小于既有文本；
+	// 此时 room <= 0，必须直接忽略粘贴，否则会切出负长度。
+	room := t.maxLength - len(runes)
+	if room <= 0 {
+		return
+	}
+	if len(clipRunes) > room {
+		clipRunes = clipRunes[:room]
+	}
+	newRunes := append(runes[:t.cursorPos], append(clipRunes, runes[t.cursorPos:]...)...)
+	t.text = string(newRunes)
+	t.cursorPos += len(clipRunes)
+	t.notifyChange()
+}
+
+// 输入框换行清洗用的替换器：先处理 CRLF，再处理孤立的 CR，顺序不能反。
+var (
+	stripLineBreaks     = strings.NewReplacer("\r\n", "", "\r", "", "\n", "")
+	normalizeLineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+)
+
+// normalizeInput 按换行规则清洗进入输入框的文本。默认去掉所有换行：单行输入框（查找框）
+// 里的换行既显示不出来，又会因为按行匹配而永远找不到；保留换行时把 CRLF / CR 统一成 LF，
+// 编辑器的替换逻辑只认 LF。
+func (t *TextBox) normalizeInput(text string) string {
+	if !strings.ContainsRune(text, '\r') && !strings.ContainsRune(text, '\n') {
+		return text
+	}
+	if t.keepLineBreaks {
+		return normalizeLineBreaks.Replace(text)
+	}
+	return stripLineBreaks.Replace(text)
 }
 
 // ImeAnchor 返回输入法组合窗口应贴靠的光标客户区坐标与行高
@@ -481,10 +515,10 @@ func (t *TextBox) notifyChange() {
 	}
 }
 
-// SetText 设置文本
+// SetText 设置文本（与粘贴走同一条换行规则）
 func (t *TextBox) SetText(text string) {
-	t.text = text
-	t.cursorPos = len([]rune(text))
+	t.text = t.normalizeInput(text)
+	t.cursorPos = len([]rune(t.text))
 	t.ensureCaretVisible()
 }
 
@@ -526,6 +560,12 @@ func (t *TextBox) IsReadOnly() bool {
 // 只限制后续输入/粘贴；粘贴时按剩余空间裁剪。
 func (t *TextBox) SetMaxLength(maxLength int) {
 	t.maxLength = maxLength
+}
+
+// SetKeepLineBreaks 设置是否保留换行。默认不保留：单行输入框（如查找框）里的换行
+// 既显示不出来又没法匹配；替换框需要多行文本，保留换行但把 CRLF / CR 统一成 LF。
+func (t *TextBox) SetKeepLineBreaks(keep bool) {
+	t.keepLineBreaks = keep
 }
 
 // SetOnChange 设置改变回调

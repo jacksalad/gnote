@@ -464,6 +464,13 @@ func (sw *settingsWindow) clearStatus() {
 }
 
 func (sw *settingsWindow) apply() {
+	if err := sw.applySettings(); err != nil {
+		goui.ShowError(sw.win.Hwnd(), "设置保存失败", err.Error())
+	}
+}
+
+// applySettings 应用设置窗口里的选项并持久化；无法保存时返回给用户看的说明。
+func (sw *settingsWindow) applySettings() error {
 	s := sw.app.CurrentSettings()
 	if themes := goui.Themes(); sw.theme.Selected() >= 0 && sw.theme.Selected() < len(themes) {
 		s.Theme = themes[sw.theme.Selected()].ID
@@ -485,13 +492,13 @@ func (sw *settingsWindow) apply() {
 
 	sw.app.ApplySettings(s)
 	if err := sw.app.SaveSettings(); err != nil {
-		goui.ShowError(sw.win.Hwnd(), "设置保存失败", err.Error())
-		return
+		return err
 	}
 	sw.snapshot = s
 	if sw.status != nil {
 		sw.status.SetText("已保存")
 	}
+	return nil
 }
 
 func (sw *settingsWindow) cancel() {
@@ -532,12 +539,13 @@ func (a *App) OpenSettings() {
 	sw.show()
 }
 
-// OpenConfigFile 先保存当前设置，再把 settings.json 作为普通文档打开。
+// OpenConfigFile 把 settings.json 作为普通文档打开；当前文档不是它时先把内存里的设置落盘，
+// 让编辑器看到的就是本次会话的配置。配置文件本身读不出来时不写，直接载入让用户修复。
 func (a *App) OpenConfigFile() {
 	if !a.CheckSaveIfModified() {
 		return
 	}
-	if err := a.SaveSettings(); err != nil {
+	if err := a.saveSettingsImplicit(); err != nil && !a.settingsLoadFailed {
 		goui.ShowError(a.win.Hwnd(), "设置", fmt.Sprintf("无法保存设置文件:\n%v", err))
 		return
 	}

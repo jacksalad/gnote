@@ -4,6 +4,9 @@
 package dialog
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -32,6 +35,8 @@ const (
 	MB_ICONWARNING     = MB_ICONEXCLAMATION
 	MB_ICONERROR       = MB_ICONHAND
 	MB_ICONINFORMATION = MB_ICONASTERISK
+
+	MB_DEFBUTTON2 = 0x00000100
 
 	// MessageBox 返回值
 	IDOK     = 1
@@ -145,6 +150,7 @@ func OpenFileDialog(hwnd uintptr, title, filter, defaultExt string) (string, boo
 	ofn.maxFile = uint32(len(buf))
 	ofn.title = titlePtr
 	ofn.defExt = defExtPtr
+	ofn.filterIndex = 1 // 默认选中第一个过滤器
 	ofn.flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR
 
 	ret, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
@@ -155,9 +161,31 @@ func OpenFileDialog(hwnd uintptr, title, filter, defaultExt string) (string, boo
 	return syscall.UTF16ToString(buf), true
 }
 
+// WithFilterExtension 给没有扩展名的文件名补上第 index 个过滤器（从 1 起）的首个扩展名，
+// 例如选了 “Go 源码文件 (*.go)” 又只输入 main 时得到 main.go。
+// 过滤器没有 “*.扩展名” 形式的模式（*.*、Makefile）或文件名已有扩展名时原样返回。
+func WithFilterExtension(path, filter string, index int) string {
+	ext := ""
+	if parts := strings.Split(filter, "|"); index >= 1 && index*2-1 < len(parts) {
+		for _, pattern := range strings.Split(parts[index*2-1], ";") {
+			if p := strings.TrimSpace(pattern); strings.HasPrefix(p, "*.") && !strings.ContainsAny(p[2:], "*?") {
+				ext = strings.ToLower(p[1:])
+				break
+			}
+		}
+	}
+	if ext == "" || (filepath.Ext(path) != "" && filepath.Ext(path) != ".") {
+		return path
+	}
+	// 结尾单独一个点会被 Win32 丢掉，不算扩展名
+	return strings.TrimRight(path, ".") + ext
+}
+
 // SaveFileDialog 弹出系统原生“另存为”对话框
 // filter 格式如: "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*"
 // defaultName 默认文件名，如 "未命名.txt"
+// defaultExt 非空时照旧作为固定默认扩展名；为空时按用户选中的过滤器补全扩展名
+// （对话框的 lpstrDefExt 是静态的，固定传 "txt" 会让选了 “Go 源码文件” 再输入 main 的用户得到 main.txt）。
 // 返回用户选中的保存绝对路径及是否确认
 func SaveFileDialog(hwnd uintptr, title, filter, defaultExt, defaultName string) (string, bool) {
 	buf := make([]uint16, maxPathBufferUTF16)
@@ -184,14 +212,31 @@ func SaveFileDialog(hwnd uintptr, title, filter, defaultExt, defaultName string)
 	ofn.maxFile = uint32(len(buf))
 	ofn.title = titlePtr
 	ofn.defExt = defExtPtr
+	ofn.filterIndex = 1 // 默认选中第一个过滤器
 	ofn.flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR
 
-	ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
-	if ret == 0 {
-		return "", false
+	for {
+		ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+		if ret == 0 {
+			return "", false
+		}
+		path := syscall.UTF16ToString(buf)
+		if defExtPtr != nil {
+			return path, true
+		}
+		// 对话框自带的覆盖确认只针对用户输入的名字；补全扩展名后的文件若已存在要自己问一次。
+		// 用户选择不替换时，带着刚输入的名字回到对话框重新选择。
+		final := WithFilterExtension(path, filter, int(ofn.filterIndex))
+		if final != path {
+			if _, err := os.Stat(final); err == nil {
+				msg := fmt.Sprintf("%s 已存在。\n是否要替换它？", filepath.Base(final))
+				if MessageBox(hwnd, "确认另存为", msg, MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2) != IDYES {
+					continue
+				}
+			}
+		}
+		return final, true
 	}
-
-	return syscall.UTF16ToString(buf), true
 }
 
 // MessageBox 弹出系统原生消息提示框

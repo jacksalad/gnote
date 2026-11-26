@@ -34,7 +34,8 @@ type findBar struct {
 	current       goui.Match
 
 	openRow, openCol int
-	searchGen        int // 输入防抖代次：只有最后一次调度会真正执行
+	searchGen        int  // 输入防抖代次：只有最后一次调度会真正执行
+	searchPending    bool // 防抖窗口内查找内容已变、搜索还没执行
 	onLayoutChange   func()
 }
 
@@ -63,6 +64,9 @@ func newFindBar(area *goui.TextArea, win *goui.Window, onLayoutChange func()) *f
 	f.replaceBox.SetPlaceholder("替换为")
 	f.replaceBox.SetFont(barFont)
 	f.replaceBox.SetMaxLength(512)
+	// 多行替换是受支持的功能：替换内容里的换行要保留（统一成 LF）。
+	// 查找框保持默认：换行按行匹配永远找不到，直接去掉。
+	f.replaceBox.SetKeepLineBreaks(true)
 	f.replaceBox.SetOnSubmit(func(string) { f.replaceOne() })
 
 	f.btnCase = goui.NewButton("Aa")
@@ -280,6 +284,7 @@ func (f *findBar) scheduleSearch() {
 		f.searchFromOrigin()
 		return
 	}
+	f.searchPending = true
 	f.win.Schedule(120*time.Millisecond, func() {
 		if gen == f.searchGen {
 			f.searchFromOrigin()
@@ -290,11 +295,23 @@ func (f *findBar) scheduleSearch() {
 // cancelPendingSearch 作废尚未触发的防抖任务（立即操作优先）。
 func (f *findBar) cancelPendingSearch() {
 	f.searchGen++
+	f.searchPending = false
+}
+
+// flushPendingSearch 防抖还没到就点了 “替换 / 下一个”：先把待执行的搜索落定，
+// 否则决定替换与否用的是上一个查找内容留下的匹配状态。返回是否刚执行了搜索。
+func (f *findBar) flushPendingSearch() bool {
+	if !f.searchPending {
+		return false
+	}
+	f.searchFromOrigin()
+	return true
 }
 
 // searchFromOrigin 从打开查找条时的光标位置开始查找（用于输入/切换大小写后的增量定位）
 func (f *findBar) searchFromOrigin() {
 	f.searchGen++ // 任何立即搜索都会作废仍在等待的防抖任务
+	f.searchPending = false
 	q := f.query.GetText()
 	if q == "" {
 		f.hasMatch = false
@@ -314,6 +331,10 @@ func (f *findBar) searchFromOrigin() {
 
 // find 查找下一个/上一个匹配（从当前匹配继续，自动回绕）
 func (f *findBar) find(forward bool) {
+	// 防抖还没到：先把新查找内容的首个匹配定位出来，这一次就不再往前走
+	if f.flushPendingSearch() {
+		return
+	}
 	f.cancelPendingSearch()
 	q := f.query.GetText()
 	if q == "" {
@@ -344,6 +365,8 @@ func (f *findBar) find(forward bool) {
 
 // replaceOne 若当前匹配仍是选区则替换，然后自动跳到下一个匹配
 func (f *findBar) replaceOne() {
+	// 查找内容刚改过而搜索还没执行时，hasMatch / current 记的还是旧查找内容的匹配
+	f.flushPendingSearch()
 	f.cancelPendingSearch()
 	q := f.query.GetText()
 	if q == "" {

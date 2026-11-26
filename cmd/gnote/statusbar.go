@@ -51,11 +51,39 @@ func (a *App) showEncodingMenu() {
 	if next == a.currentEncoding {
 		return
 	}
+	a.setEncoding(next)
+}
+
+// setEncoding 切换当前文档的保存编码。
+func (a *App) setEncoding(next textio.Encoding) {
 	a.currentEncoding = next
+	a.recheckAlteration()
 	// 编码属于保存输出的一部分：切换后标记为已修改，避免关闭时丢失用户意图。
 	a.textArea.SetModified(true)
 	a.UpdateHeaderAndStatus()
 	a.win.RequestRedraw()
+}
+
+// recheckAlteration 切换编码后重新判定：文件现状按新编码写出，字节是否还与现在一样。
+// 切回原来的编码则字节恢复一致，不再需要确认；载入时丢过字节的原因无论如何都换不回来，优先保留。
+func (a *App) recheckAlteration() {
+	keep := a.alter
+	a.alter = alterNone
+	if keep == alterDecode {
+		a.alter = alterDecode
+		return
+	}
+	if len(a.loadedData) == 0 {
+		return
+	}
+	text, err := textio.DecodeAs(a.loadedData, a.baseEnc)
+	if err != nil {
+		a.alter = keep
+		return
+	}
+	if !textio.RoundTrips(a.loadedData, text, a.currentEncoding) {
+		a.alter = alterConvert
+	}
 }
 
 func (a *App) showEOLMenu() {
@@ -116,10 +144,8 @@ func (a *App) showLanguageMenu() {
 		{"TOML", goui.NewTOMLHighlighter()},
 	}
 
-	current := "纯文本"
-	if a.highlightEnabled && a.currentHighlighter != nil {
-		current = goui.GetLanguageName(a.currentHighlighter)
-	}
+	// 勾选项跟随实际挂载的高亮器：全局偏好关闭时源码也显示为纯文本。
+	current := goui.GetLanguageName(a.textArea.GetHighlighter())
 
 	items := make([]goui.MenuItem, 0, len(choices))
 	for i, choice := range choices {
@@ -134,16 +160,15 @@ func (a *App) showLanguageMenu() {
 	if chosen == 0 || int(chosen) > len(choices) {
 		return
 	}
-	next := choices[chosen-1].h
-	if next == nil {
-		a.currentHighlighter = nil
-		a.highlightEnabled = false
-		a.textArea.SetHighlighter(nil)
-	} else {
-		a.currentHighlighter = next
-		a.highlightEnabled = true
-		a.textArea.SetHighlighter(next)
-	}
+	a.setDocumentLanguage(choices[chosen-1].h)
+}
+
+// setDocumentLanguage 为当前文档指定高亮器（nil 为纯文本）。只影响这一个文档：
+// 全局高亮偏好 highlightEnabled 原样保留，不会因为选了 “纯文本” 就被连带保存成关闭。
+// 用户明确为文档挑了一种语言时直接挂载，哪怕全局偏好是关的。
+func (a *App) setDocumentLanguage(h goui.Highlighter) {
+	a.currentHighlighter = h
+	a.textArea.SetHighlighter(h)
 	a.UpdateHeaderAndStatus()
 	a.win.RequestRedraw()
 }

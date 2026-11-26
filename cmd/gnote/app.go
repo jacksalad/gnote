@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	goui "github.com/jacksalad/gnote"
 	"github.com/jacksalad/gnote/format"
@@ -15,7 +16,11 @@ import (
 )
 
 // fileFilter 文件对话框的统一过滤器，打开/保存共用。
-const fileFilter = "支持的文档 (*.txt;*.md;*.json;*.yaml;*.yml;*.toml;*.go;*.py;*.c;*.cpp;*.h;*.hpp;*.cs;*.java;*.rs;*.r;*.js;*.jsx;*.ts;*.tsx;*.html;*.htm;*.css;*.sql)|*.txt;*.md;*.json;*.yaml;*.yml;*.toml;*.go;*.py;*.c;*.cpp;*.h;*.hpp;*.cs;*.java;*.rs;*.r;*.js;*.jsx;*.ts;*.tsx;*.html;*.htm;*.css;*.sql|" +
+// 第一个过滤器是打开对话框默认选中的那个：除了 16 种高亮语言，还要直接列出常见的文本、
+// 配置、脚本文件和 Makefile 这类无后缀文件，否则它们要切到 “所有文件” 才看得见。
+const fileFilter = "文本与代码文件 (*.txt;*.md;*.json;*.yaml;*.yml;*.toml;*.go;*.py;*.c;*.cpp;*.h;*.hpp;*.cs;*.java;*.rs;*.r;*.js;*.jsx;*.ts;*.tsx;*.html;*.htm;*.css;*.sql;*.xml;*.ini;*.log;*.bat;*.cmd;*.ps1;*.sh;*.csv;*.cfg;*.conf;*.env;*.properties;*.gradle;*.lua;*.php;*.rb;*.kt;*.vue;Makefile;Dockerfile;.gitignore)|" +
+	"*.txt;*.md;*.json;*.yaml;*.yml;*.toml;*.go;*.py;*.c;*.cpp;*.h;*.hpp;*.cs;*.java;*.rs;*.r;*.js;*.jsx;*.ts;*.tsx;*.html;*.htm;*.css;*.sql;" +
+	"*.xml;*.ini;*.log;*.bat;*.cmd;*.ps1;*.sh;*.csv;*.cfg;*.conf;*.env;*.properties;*.gradle;*.lua;*.php;*.rb;*.kt;*.vue;Makefile;Dockerfile;.gitignore|" +
 	"Go 源码文件 (*.go)|*.go|" +
 	"Python 脚本文件 (*.py;*.pyw)|*.py;*.pyw|" +
 	"C/C++ 源码文件 (*.c;*.cpp;*.cc;*.cxx;*.h;*.hpp)|*.c;*.cpp;*.cc;*.cxx;*.h;*.hpp|" +
@@ -55,6 +60,15 @@ type App struct {
 	highlightEnabled   bool
 	themeID            string
 
+	// 文档保真：loadedData / baseEnc 是最近一次载入或成功保存时的文件字节及其编码，
+	// 状态栏切换编码后据此重新判定 “按新编码写出的字节是否与文件现状不同”。
+	loadedData []byte
+	baseEnc    textio.Encoding
+	alter      saveAlterReason
+
+	// statusHint 状态栏左侧正在显示的短暂提示（空表示没有）。
+	statusHint string
+
 	// UI 引用
 	menuBar       *goui.MenuBar
 	menuSpacer    *goui.Panel
@@ -79,6 +93,9 @@ type App struct {
 	uiScale          float64
 	// settingsPathOverride 仅用于测试，生产环境为空。
 	settingsPathOverride string
+	// settingsLoadFailed 启动时配置文件存在却读不出来（JSON 语法错误、被占用、无权限）。
+	// 此时运行在默认值上，不能在退出时用默认值覆盖用户的文件。
+	settingsLoadFailed bool
 }
 
 // NewApp 创建应用状态与核心编辑器，但尚不构建窗口内容。
@@ -178,6 +195,7 @@ func (a *App) showStartupDocument(welcomeDoc string) {
 }
 
 func (a *App) showWelcomeDoc(welcomeDoc string) {
+	a.resetFidelity()
 	a.currentEncoding = textio.DefaultEncoding()
 	a.currentEOL = textio.DefaultEOL()
 	a.currentStamp = textio.Stamp{}
@@ -189,6 +207,7 @@ func (a *App) showWelcomeDoc(welcomeDoc string) {
 
 // showBlankDoc 重置为未命名空白文档，不写入任何提示文本。
 func (a *App) showBlankDoc() {
+	a.resetFidelity()
 	a.currentEncoding = textio.DefaultEncoding()
 	a.currentEOL = textio.DefaultEOL()
 	a.currentStamp = textio.Stamp{}
@@ -279,9 +298,9 @@ func (a *App) buildCommands() {
 		Enabled: a.textArea.CanUndo})
 	add(&Command{ID: cmdEditRedo, Title: "重做", Accel: "Ctrl+Y", Run: func() { a.textArea.Redo() },
 		Enabled: a.textArea.CanRedo})
-	add(&Command{ID: cmdEditCut, Title: "剪切", Accel: "Ctrl+X", Run: func() { a.textArea.Cut() },
+	add(&Command{ID: cmdEditCut, Title: "剪切", Accel: "Ctrl+X", Run: a.cutSelection,
 		Enabled: func() bool { return a.textArea.HasSelection() && !a.textArea.IsReadOnly() }})
-	add(&Command{ID: cmdEditCopy, Title: "复制", Accel: "Ctrl+C", Run: func() { a.textArea.Copy() },
+	add(&Command{ID: cmdEditCopy, Title: "复制", Accel: "Ctrl+C", Run: a.copySelection,
 		Enabled: a.textArea.HasSelection})
 	add(&Command{ID: cmdEditPaste, Title: "粘贴", Accel: "Ctrl+V", Run: func() { a.textArea.Paste() },
 		Enabled: func() bool { return !a.textArea.IsReadOnly() }})
@@ -330,7 +349,7 @@ func (a *App) showAbout() {
 
 const shortcutsText = "Ctrl+N/O/S/Shift+S 新建 / 打开 / 保存 / 另存为\n" +
 	"Ctrl+Shift+F          格式化 JSON / HTML\n" +
-	"Ctrl+F / Ctrl+H       查找 / 替换（F3 下一个）\n" +
+	"Ctrl+F / Ctrl+H       查找 / 替换（F3 下一个，Shift+F3 上一个）\n" +
 	"Ctrl+Z / Ctrl+Y       撤销 / 重做\n" +
 	"Ctrl+A / X / C / V    全选 / 剪切 / 复制 / 粘贴\n" +
 	"Ctrl+滚轮 / Ctrl+±/0  缩放 / 重置\n" +
@@ -650,9 +669,9 @@ func (a *App) bindWindowEvents() {
 			}
 			return
 		}
-		if key.KeyCode == 0x72 { // F3 查找下一个
+		if key.KeyCode == 0x72 { // F3 查找下一个，Shift+F3 查找上一个
 			if a.findBar.visible {
-				a.findBar.find(true)
+				a.findBar.find(!key.Shift)
 			}
 			return
 		}
@@ -693,6 +712,11 @@ func (a *App) bindWindowEvents() {
 		}
 		data, ok := evt.Data.(goui.MouseData)
 		if !ok {
+			return
+		}
+		if bar := a.menuBar.GetBounds(); data.Y >= bar.Y && data.Y < bar.Y+a.menuBar.BarHeight() {
+			// 点击菜单栏标题交给 MenuBar 自己处理：它打开菜单时会记下当前焦点、关闭后还回去。
+			// 这里若先把键盘焦点挪给编辑器，查找条的输入焦点就被顶掉，菜单关闭后输入会串进正文。
 			return
 		}
 		if a.findBar.contains(data.X, data.Y) {
@@ -799,7 +823,10 @@ func (a *App) UpdateHeaderAndStatus() {
 		a.win.SetTitle(displayTitle)
 	}
 
-	if a.currentFilePath == "" {
+	if a.statusHint != "" {
+		// 短暂提示（如剪贴板被占用）占用左侧最宽的一段，到时间由 clearStatusHint 恢复
+		a.lblFileStatus.SetText(a.statusHint)
+	} else if a.currentFilePath == "" {
 		if a.textArea.IsModified() {
 			a.lblFileStatus.SetText("新文档 * (未保存)")
 		} else {
@@ -813,10 +840,8 @@ func (a *App) UpdateHeaderAndStatus() {
 		}
 	}
 
-	docType := "纯文本"
-	if a.highlightEnabled && a.textArea.GetHighlighter() != nil {
-		docType = goui.GetLanguageName(a.textArea.GetHighlighter())
-	}
+	// 文档语言显示实际挂载的高亮器：全局偏好关闭时源码也按纯文本显示。
+	docType := goui.GetLanguageName(a.textArea.GetHighlighter())
 
 	r, c := a.textArea.GetCursorPosition()
 	a.lblPosStatus.SetText(fmt.Sprintf("%d:%d · %d 行", r, c, a.textArea.GetLineCount()))
@@ -826,12 +851,21 @@ func (a *App) UpdateHeaderAndStatus() {
 	a.lblZoom.SetText(fmt.Sprintf("%d%%", a.textArea.GetZoomPercent()))
 }
 
-// ApplyHighlighterForFile 根据文件后缀嗅探高亮器；高亮关闭时只记录，不挂载。
+// ApplyHighlighterForFile 根据文件后缀嗅探高亮器；全局高亮关闭时只记录，不挂载。
 func (a *App) ApplyHighlighterForFile(path string) {
 	a.currentHighlighter = goui.DetectHighlighter(path)
-	if a.highlightEnabled {
+	a.applyDocumentHighlight()
+}
+
+// applyDocumentHighlight 由全局偏好与当前文档的语言合成实际挂载的高亮器。
+// highlightEnabled 只是会被持久化的全局偏好；某个文档选了 “纯文本” 或没有可识别的后缀，
+// 只影响 currentHighlighter，不改偏好。
+func (a *App) applyDocumentHighlight() {
+	if a.highlightEnabled && a.currentHighlighter != nil {
 		a.textArea.SetHighlighter(a.currentHighlighter)
+		return
 	}
+	a.textArea.SetHighlighter(nil)
 }
 
 // formatTarget 返回当前文档可用的格式化类型。
@@ -869,6 +903,51 @@ func (a *App) FormatDocument() {
 	a.win.RequestRedraw()
 }
 
+// clipboardBusyHint 复制 / 剪切写不进剪贴板时在状态栏显示的提示。
+const clipboardBusyHint = "剪贴板被其他程序占用，请重试"
+
+// statusHintTimeout 状态栏提示的停留时间。
+const statusHintTimeout = 3 * time.Second
+
+// copySelection / cutSelection 复制 / 剪切选区。
+func (a *App) copySelection() { a.transferSelection(a.textArea.Copy) }
+
+func (a *App) cutSelection() { a.transferSelection(a.textArea.Cut) }
+
+// transferSelection 执行复制或剪切。没有选区是正常的空操作；
+// 有选区却写不进剪贴板（被其他程序占用）时用状态栏提示代替沉默。
+func (a *App) transferSelection(transfer func() bool) {
+	if !a.textArea.HasSelection() {
+		transfer()
+		return
+	}
+	if !transfer() {
+		a.showStatusHint(clipboardBusyHint)
+	}
+}
+
+// showStatusHint 在状态栏左侧短暂显示一条提示，到时间后恢复原来的内容。
+func (a *App) showStatusHint(text string) {
+	a.statusHint = text
+	a.UpdateHeaderAndStatus()
+	if a.win != nil {
+		a.win.RequestRedraw()
+		a.win.Schedule(statusHintTimeout, func() { a.clearStatusHint(text) })
+	}
+}
+
+// clearStatusHint 提示到期后恢复状态栏；已被更新的提示取代时什么都不做。
+func (a *App) clearStatusHint(text string) {
+	if a.statusHint != text {
+		return
+	}
+	a.statusHint = ""
+	a.UpdateHeaderAndStatus()
+	if a.win != nil {
+		a.win.RequestRedraw()
+	}
+}
+
 func (a *App) ToggleLineNumbers() {
 	a.textArea.SetShowLineNumbers(!a.textArea.IsShowLineNumbers())
 	a.win.RequestRedraw()
@@ -881,16 +960,9 @@ func (a *App) ToggleWordWrap() {
 
 func (a *App) ToggleHighlight() {
 	a.highlightEnabled = !a.highlightEnabled
-	if a.highlightEnabled {
-		if a.currentHighlighter == nil {
-			// 纯文本（.txt/无后缀）没有语言高亮器，保持纯文本即可，
-			// 不能回退到 Markdown 而把普通文本误标成 Markdown。
-			a.currentHighlighter = goui.DetectHighlighter(a.currentFileName)
-		}
-		a.textArea.SetHighlighter(a.currentHighlighter)
-	} else {
-		a.textArea.SetHighlighter(nil)
-	}
+	// 纯文本（.txt/无后缀）没有语言高亮器，打开偏好后保持纯文本即可，
+	// 不能回退到 Markdown 而把普通文本误标成 Markdown。
+	a.applyDocumentHighlight()
 	a.UpdateHeaderAndStatus()
 	a.win.RequestRedraw()
 }
@@ -932,12 +1004,66 @@ func (a *App) handleClose() bool {
 	if !a.CheckSaveIfModified() {
 		return false
 	}
-	_ = a.SaveSettings()
+	_ = a.saveSettingsImplicit()
 	return true
 }
 
+// savePrompt 保存前的三态确认框（是 / 否 / 取消）。包级变量仅用于测试替换原生对话框，
+// 保证测试里不会弹出 MessageBox；生产环境不要改写。
+var savePrompt = goui.ShowConfirmYesNoCancel
+
+// saveAlterReason 这次保存会改写 “用户没有明确要求改写” 的文件字节的原因。
+type saveAlterReason int
+
+const (
+	alterNone    saveAlterReason = iota // 写出字节与文件现状一致，只差用户自己的编辑
+	alterDecode                         // 载入时就有无法解码的字节，目前显示为 � 或 "?"
+	alterConvert                        // 载入后切换过编码，按新编码写出的字节与文件现状不同
+)
+
+// saveWarning 汇总保存前需要用户确认的原因并生成说明；replaced 表示有字符无法用目标编码表示、
+// 将以 "?" 写出。多个原因合成一次询问，不需要确认时 need 为 false。
+// 与原生对话框解耦，便于单测 “这次保存要不要问”。
+func saveWarning(encName string, replaced bool, alter saveAlterReason, from textio.Encoding) (msg string, need bool) {
+	var notes []string
+	switch alter {
+	case alterDecode:
+		notes = append(notes, fmt.Sprintf("文件载入时有无法按「%s」解码的字节（文件可能已损坏，或编码识别有误），\n它们目前显示为 � 或 \"?\"。",
+			from.Name()))
+	case alterConvert:
+		notes = append(notes, fmt.Sprintf("保存编码已从「%s」切换为「%s」，保存后文件的字节与文件现状不同。",
+			from.Name(), encName))
+	}
+	if replaced {
+		notes = append(notes, fmt.Sprintf("文档中包含无法用 %s 编码表示的字符（如 emoji 或生僻字），\n这些字符将以 \"?\" 代替保存。",
+			encName))
+	}
+	if len(notes) == 0 {
+		return "", false
+	}
+	return strings.Join(notes, "\n\n") + "\n\n是否仍要保存？", true
+}
+
+// resetFidelity 新文档没有 “文件现状”，不存在保存改写原内容的问题。
+func (a *App) resetFidelity() {
+	a.loadedData = nil
+	a.baseEnc = textio.Encoding{}
+	a.alter = alterNone
+}
+
+// noteFileState 记录文件的当前字节：刚载入（lossless 为 false 表示载入时已有字节无法还原）或刚成功写出。
+func (a *App) noteFileState(data []byte, enc textio.Encoding, lossless bool) {
+	a.loadedData = data
+	a.baseEnc = enc
+	a.alter = alterNone
+	if !lossless {
+		a.alter = alterDecode
+	}
+}
+
 // WriteDocumentTo 按当前编码与换行风格写入指定路径。
-// 写盘失败时返回 false，文件绑定与身份戳由调用方在成功后再提交。
+// 写出的字节会改写用户没有明确要求改写的内容（载入时丢过字节、切换过编码、有字符不可表示）时先确认，
+// 取消则什么都不动。写盘失败时返回 false，文件绑定与身份戳由调用方在成功后再提交。
 func (a *App) WriteDocumentTo(path string) bool {
 	text := a.textArea.GetTextWithEOL(a.currentEOL.Sequence())
 	data, replaced, err := textio.Encode(text, a.currentEncoding)
@@ -946,9 +1072,8 @@ func (a *App) WriteDocumentTo(path string) bool {
 			fmt.Sprintf("无法用 %s 编码保存该文档:\n%v", a.currentEncoding.Name(), err))
 		return false
 	}
-	if replaced {
-		msg := fmt.Sprintf("文档中包含无法用 %s 编码表示的字符（如 emoji 或生僻字），\n这些字符将以 \"?\" 代替保存。是否继续？", a.currentEncoding.Name())
-		if goui.ShowConfirmYesNoCancel(a.win.Hwnd(), "编码警告", msg) != goui.IDYES {
+	if msg, need := saveWarning(a.currentEncoding.Name(), replaced, a.alter, a.baseEnc); need {
+		if savePrompt(a.win.Hwnd(), "编码警告", msg) != goui.IDYES {
 			return false
 		}
 	}
@@ -956,21 +1081,22 @@ func (a *App) WriteDocumentTo(path string) bool {
 		goui.ShowError(a.win.Hwnd(), "保存错误", fmt.Sprintf("无法保存文件:\n%v", err))
 		return false
 	}
+	// 用户确认过这次写出的内容之后，文件里就不再有他没见过的字节。
+	a.noteFileState(data, a.currentEncoding, true)
 	return true
 }
 
-// Save 执行保存；未命名文件会先触发另存为。
-func (a *App) Save() bool {
-	target := a.currentFilePath
-	if target == "" {
-		path, ok := goui.SaveFileDialog(a.win.Hwnd(), "保存文档", fileFilter, ".txt", a.currentFileName)
-		if !ok || path == "" {
-			return false
-		}
-		target = path
-	} else if !a.currentStamp.Same(target) {
+// sameFilePath 比较两个路径是否指向同一个文件（Windows 路径不区分大小写）。
+func sameFilePath(a, b string) bool {
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// saveToPath 把文档保存到已确定的路径并提交文件绑定。
+// 目标就是当前文件时（包括 “另存为” 到同一个路径）先确认外部修改；写盘成功后才提交绑定。
+func (a *App) saveToPath(target string) bool {
+	if a.currentFilePath != "" && sameFilePath(target, a.currentFilePath) && !a.currentStamp.Same(target) {
 		msg := fmt.Sprintf("文件 \"%s\" 已在 gnote 之外被修改或删除。\n继续保存将覆盖外部更改，是否继续？", a.currentFileName)
-		if goui.ShowConfirmYesNoCancel(a.win.Hwnd(), "文件已被外部修改", msg) != goui.IDYES {
+		if savePrompt(a.win.Hwnd(), "文件已被外部修改", msg) != goui.IDYES {
 			return false
 		}
 	}
@@ -980,34 +1106,41 @@ func (a *App) Save() bool {
 	}
 	// 写盘成功后才提交文件绑定：编码确认取消、写盘失败时，
 	// 文档仍保留原来的路径/标题，不会在下次 Ctrl+S 时静默写到新路径。
-	if target != a.currentFilePath {
+	if !sameFilePath(target, a.currentFilePath) {
 		a.currentFilePath = target
 		a.currentFileName = filepath.Base(target)
 		a.ApplyHighlighterForFile(target)
 	}
 	a.currentStamp = textio.Stat(target)
 	a.textArea.SetModified(false)
+	// 保存的正是配置文件：会话跟随文件内容，内存里的设置不再比文件新。
+	if sameFilePath(target, a.settingsFilePath()) {
+		a.reloadSettingsFromDisk()
+	}
 	a.UpdateHeaderAndStatus()
 	return true
 }
 
+// Save 执行保存；未命名文件会先触发另存为。
+func (a *App) Save() bool {
+	target := a.currentFilePath
+	if target == "" {
+		path, ok := goui.SaveFileDialog(a.win.Hwnd(), "保存文档", fileFilter, "", a.currentFileName)
+		if !ok || path == "" {
+			return false
+		}
+		target = path
+	}
+	return a.saveToPath(target)
+}
+
 // SaveAs 执行另存为。
 func (a *App) SaveAs() bool {
-	path, ok := goui.SaveFileDialog(a.win.Hwnd(), "另存为", fileFilter, ".txt", a.currentFileName)
+	path, ok := goui.SaveFileDialog(a.win.Hwnd(), "另存为", fileFilter, "", a.currentFileName)
 	if !ok || path == "" {
 		return false
 	}
-
-	if !a.WriteDocumentTo(path) {
-		return false
-	}
-	a.currentFilePath = path
-	a.currentFileName = filepath.Base(path)
-	a.ApplyHighlighterForFile(path)
-	a.currentStamp = textio.Stat(path)
-	a.textArea.SetModified(false)
-	a.UpdateHeaderAndStatus()
-	return true
+	return a.saveToPath(path)
 }
 
 // CheckSaveIfModified 检查未保存修改并提示保存。
@@ -1022,7 +1155,7 @@ func (a *App) CheckSaveIfModified() bool {
 		docName = "未命名"
 	}
 	prompt := fmt.Sprintf("你想将更改保存到 \"%s\" 吗？", docName)
-	ret := goui.ShowConfirmYesNoCancel(a.win.Hwnd(), "gnote", prompt)
+	ret := savePrompt(a.win.Hwnd(), "gnote", prompt)
 	switch ret {
 	case goui.IDYES:
 		return a.Save()
@@ -1057,6 +1190,7 @@ func (a *App) LoadFile(targetPath string) bool {
 			a.textArea.SetText("")
 			a.textArea.SetLineEnding(a.currentEOL.Sequence())
 			a.textArea.SetModified(false)
+			a.resetFidelity()
 			a.ApplyHighlighterForFile(a.currentFilePath)
 			a.textArea.SetFocused(true)
 			a.UpdateHeaderAndStatus()
@@ -1085,7 +1219,7 @@ func (a *App) LoadFile(targetPath string) bool {
 		return false
 	}
 
-	text, enc, err := textio.Decode(data)
+	res, err := textio.DecodeDetailed(data)
 	if err != nil {
 		if errors.Is(err, textio.ErrBinary) {
 			goui.ShowError(a.win.Hwnd(), "打开错误",
@@ -1097,14 +1231,16 @@ func (a *App) LoadFile(targetPath string) bool {
 		return false
 	}
 
-	a.currentEOL = textio.AnalyzeEOL(text)
-	a.currentEncoding = enc
-	a.textArea.SetText(text)
+	a.currentEOL = textio.AnalyzeEOL(res.Text)
+	a.currentEncoding = res.Encoding
+	a.textArea.SetText(res.Text)
 	a.textArea.SetLineEnding(a.currentEOL.Sequence())
 	a.currentFilePath = targetPath
 	a.currentFileName = filepath.Base(targetPath)
-	a.currentStamp = textio.Stat(targetPath)
+	// 身份戳取读取之前的那次 Stat：文件若恰好在读取期间被改写，保存前仍能发现这次外部修改。
+	a.currentStamp = textio.Stamp{Exists: true, Size: fi.Size(), ModTime: fi.ModTime()}
 	a.textArea.SetModified(false)
+	a.noteFileState(data, res.Encoding, res.Lossless)
 
 	a.ApplyHighlighterForFile(a.currentFilePath)
 	a.textArea.SetFocused(true)
@@ -1138,9 +1274,10 @@ func (a *App) NewDocument() {
 	a.currentEOL = textio.DefaultEOL()
 	a.currentStamp = textio.Stamp{}
 	a.textArea.SetLineEnding(a.currentEOL.Sequence())
+	a.resetFidelity()
 
-	// 新文档没有后缀可嗅探：同步关闭高亮开关，避免菜单勾选与实际状态不一致
-	a.highlightEnabled = false
+	// 新文档没有后缀可嗅探，只是没有高亮器；全局高亮偏好原样保留，
+	// 之后打开的源码文件照常高亮。
 	a.currentHighlighter = nil
 	a.textArea.SetHighlighter(nil)
 	a.textArea.SetModified(false)

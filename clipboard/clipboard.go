@@ -79,13 +79,8 @@ func GetText() string {
 
 // SetText 向系统剪贴板写入纯文本
 func SetText(text string) bool {
-	if !openClipboardRetry() {
-		return false
-	}
-	defer closeClipboard.Call()
-
-	emptyClipboard.Call()
-
+	// 校验、分配、拷贝都放在打开剪贴板之前：文本含 NUL 无法作为 CF_UNICODETEXT，
+	// 或内存分配失败时直接返回，剪贴板里原有的内容不会先被清空再丢下不管。
 	utf16, err := syscall.UTF16FromString(text)
 	if err != nil {
 		return false
@@ -104,6 +99,14 @@ func SetText(text string) bool {
 
 	rtlMoveMemory.Call(ptr, uintptr(unsafe.Pointer(&utf16[0])), uintptr(len(utf16))*2)
 	globalUnlock.Call(hMem)
+
+	if !openClipboardRetry() {
+		globalFree.Call(hMem)
+		return false
+	}
+	defer closeClipboard.Call()
+
+	emptyClipboard.Call()
 
 	ret, _, _ := setClipboardData.Call(CF_UNICODETEXT, hMem)
 	if ret == 0 {
