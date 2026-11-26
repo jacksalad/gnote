@@ -64,17 +64,31 @@ func formatJS(src, base string) (string, error) {
 // 分词
 // ---------------------------------------------------------------------------
 
+// 括号的语法角色，决定 ')' 之后能否紧跟正则。
+const (
+	jsParenPlain   byte = iota // 普通括号
+	jsParenControl             // if/while/switch/catch 的条件括号：')' 之后可以紧跟正则
+	jsParenFor                 // for 头部括号：of 只在这里才是关键字
+)
+
 func tokenizeJS(src string) ([]jsToken, error) {
 	tokens := make([]jsToken, 0, len(src)/8+1)
 
 	var (
-		space    bool
-		newlines int
-		last     jsToken
-		hasLast  bool
-		regexOK  = true
-		parens   []bool // true = if/for/while 等控制条件括号
-		braces   []bool // true = 语句块，false = 对象/解构字面量
+		space     bool
+		newlines  int
+		lineBreak bool // 上一个非注释 Token 之后是否出现过换行
+		// last 是最近一个非注释 Token：注释夹在两个 Token 之间时，语法上下文
+		// 应当跳过注释往前看，否则 if (a) /* c */ { 里的 '{' 会被当成对象字面量。
+		last      jsToken
+		hasLast   bool
+		before    jsToken // last 之前的两个 Token，用来识别 class A { / 标签语句 / case 1: {
+		hasBefore bool
+		older     jsToken
+		hasOlder  bool
+		regexOK   = true
+		parens    []byte
+		braces    []bool // true = 语句块，false = 对象/解构字面量
 	)
 
 	emit := func(tok jsToken) {
@@ -94,7 +108,10 @@ func tokenizeJS(src string) ([]jsToken, error) {
 
 		switch tok.kind {
 		case jsWord:
-			regexOK = jsPrefixKeyword(tok.text)
+			// x.in / x?.default 里的 in/default 是属性名，of 在 for 头部之外只是
+			// 普通标识符：它们后面的 '/' 是除号，不是正则起点。
+			regexOK = jsPrefixKeyword(tok.text) && !jsPropertyAccess(last, hasLast) &&
+				(tok.text != "of" || jsInForHead(parens))
 		case jsNumber, jsString, jsTemplate, jsRegex:
 			regexOK = false
 		case jsLineComment, jsBlockComment:
@@ -102,21 +119,23 @@ func tokenizeJS(src string) ([]jsToken, error) {
 		case jsPunct:
 			switch tok.text {
 			case "(":
-				parens = append(parens, jsControlParen(last, hasLast))
+				parens = append(parens, jsParenKind(last, hasLast))
 				regexOK = true
 			case ")":
-				control := false
+				kind := jsParenPlain
 				if len(parens) > 0 {
-					control = parens[len(parens)-1]
+					kind = parens[len(parens)-1]
 					parens = parens[:len(parens)-1]
 				}
-				regexOK = control
+				regexOK = kind != jsParenPlain
 			case "[":
 				regexOK = true
 			case "]":
 				regexOK = false
 			case "{":
-				braces = append(braces, jsBlockBrace(last, hasLast))
+				inBlock := len(braces) == 0 || braces[len(braces)-1]
+				braces = append(braces, jsBlockBrace(last, hasLast) ||
+					jsStatementBlockBrace(last, hasLast, before, hasBefore, older, hasOlder, inBlock))
 				regexOK = true
 			case "}":
 				block := true
@@ -131,8 +150,13 @@ func tokenizeJS(src string) ([]jsToken, error) {
 				regexOK = true
 			}
 		}
-		last = tok
-		hasLast = true
+
+		if tok.kind != jsLineComment && tok.kind != jsBlockComment {
+			older, hasOlder = before, hasBefore
+			before, hasBefore = last, hasLast
+			last, hasLast = tok, true
+			lineBreak = false
+		}
 	}
 
 	for i := 0; i < len(src); {
@@ -149,12 +173,14 @@ func tokenizeJS(src string) ([]jsToken, error) {
 			}
 			newlines++
 			space = false
+			lineBreak = true
 			i++
 			continue
 
 		case ch == '\n':
 			newlines++
 			space = false
+			lineBreak = true
 			i++
 			continue
 		}
@@ -212,8 +238,17 @@ func tokenizeJS(src string) ([]jsToken, error) {
 			continue
 		}
 
-		if ch == '/' && regexOK {
-			if end := scanJSRegex(src, i); end > 0 {
+		if ch == '/' {
+			end := 0
+			if regexOK {
+				end = scanJSRegex(src, i)
+			} else if lineBreak && jsEndsExpression(last, hasLast) {
+				// 换行后的 '/'：除法读法不成立时，它只可能是作者写的正则字面量。
+				if end = scanJSRegex(src, i); end > 0 && !jsRegexOnlyReading(src, end) {
+					end = 0
+				}
+			}
+			if end > 0 {
 				emit(jsToken{kind: jsRegex, text: src[i:end]})
 				i = end
 				continue
@@ -243,7 +278,8 @@ func tokenizeJS(src string) ([]jsToken, error) {
 		i += len(op)
 	}
 
-	if !hasLast {
+	// 只有注释的脚本同样是有效输入，不能因为 last 只记非注释 Token 就判成空文档。
+	if len(tokens) == 0 {
 		return nil, ErrEmptyDocument
 	}
 	if len(parens) != 0 || len(braces) != 0 {
@@ -364,6 +400,80 @@ func scanJSRegex(src string, i int) int {
 	return -1
 }
 
+// jsEndsExpression 报告 prev 能否作为表达式的结尾。这类 Token 之后的 '/' 在
+// 引擎里默认是除号，换行也不会改变这一点（引擎不做 ASI 回溯）。
+func jsEndsExpression(prev jsToken, hasPrev bool) bool {
+	if !hasPrev {
+		return false
+	}
+	switch prev.kind {
+	case jsWord, jsNumber, jsString, jsTemplate, jsRegex:
+		return true
+	case jsPunct:
+		switch prev.text {
+		case ")", "]", "}", "++", "--":
+			return true
+		}
+	}
+	return false
+}
+
+// jsRegexOnlyReading 报告在 src[:end] 处结束的正则字面量是否是唯一可能成立的读法。
+// 换行后紧跟在表达式结尾的 '/' 默认是除号，只有除法读法在语法上不成立时，它才是
+// 作者写的正则。除法读法要求第二个 '/' 之后是一个操作数，所以：
+//   - 带修饰位（/re/g）时除法读法总是成立：修饰位本身就是那个操作数；
+//   - 闭合的 '/' 紧跟 '/' 或 '*' 时可能是注释的开头，除法读法仍然成立；
+//   - 其后（跳过空白与注释）第一个有意义的字符开不了操作数时，除法读法不成立。
+//
+// 两种读法都说得通时一律维持除号，合法代码的语义因此不会改变。
+func jsRegexOnlyReading(src string, end int) bool {
+	if isJSIdentPart(src, end-1) {
+		return false // 带修饰位
+	}
+	if end >= len(src) {
+		return true // 除号后面再没有操作数
+	}
+	if c := src[end]; c == '/' || c == '*' {
+		return false
+	}
+	for i := end; i < len(src); {
+		switch {
+		case strings.ContainsRune(" \t\f\v\r\n", rune(src[i])):
+			i++
+		case strings.HasPrefix(src[i:], "//"):
+			j := strings.IndexByte(src[i+2:], '\n')
+			if j < 0 {
+				return true
+			}
+			i += j + 3
+		case strings.HasPrefix(src[i:], "/*"):
+			j := strings.Index(src[i+2:], "*/")
+			if j < 0 {
+				return true // 注释没有闭合，后面不会再有 Token
+			}
+			i += j + 4
+		default:
+			return !jsStartsOperand(src, i)
+		}
+	}
+	return true
+}
+
+// jsStartsOperand 报告 src[i] 处能否开始一个操作数（一元表达式）。
+func jsStartsOperand(src string, i int) bool {
+	ch := src[i]
+	switch {
+	case ch >= utf8.RuneSelf, isJSIdentStart(src, i), isJSNumberStart(src, i):
+		return true
+	case strings.ContainsRune("([{+-!~/'\"`#@", rune(ch)):
+		return true
+	case ch == '?' && i+1 < len(src) && src[i+1] == '.':
+		// "?." 是可选链，开不了操作数；"?.5" 这种写法按操作数处理。
+		return i+2 < len(src) && src[i+2] >= '0' && src[i+2] <= '9'
+	}
+	return false
+}
+
 func isJSNumberStart(src string, i int) bool {
 	if src[i] >= '0' && src[i] <= '9' {
 		return true
@@ -448,15 +558,28 @@ func jsPrefixKeyword(word string) bool {
 	return false
 }
 
-func jsControlParen(prev jsToken, hasPrev bool) bool {
+// jsParenKind 判断刚打开的 '(' 属于哪一类括号。
+func jsParenKind(prev jsToken, hasPrev bool) byte {
 	if !hasPrev || prev.kind != jsWord {
-		return false
+		return jsParenPlain
 	}
 	switch prev.text {
-	case "if", "while", "for", "with", "switch", "catch":
-		return true
+	case "for":
+		return jsParenFor
+	case "if", "while", "with", "switch", "catch":
+		return jsParenControl
 	}
-	return false
+	return jsParenPlain
+}
+
+// jsInForHead 报告当前位置是否在 for 头部括号内。
+func jsInForHead(parens []byte) bool {
+	return len(parens) > 0 && parens[len(parens)-1] == jsParenFor
+}
+
+// jsPropertyAccess 报告 prev 是否是成员访问运算符（'.' / '?.'）。
+func jsPropertyAccess(prev jsToken, hasPrev bool) bool {
+	return hasPrev && prev.kind == jsPunct && (prev.text == "." || prev.text == "?.")
 }
 
 func jsBlockBrace(prev jsToken, hasPrev bool) bool {
@@ -469,9 +592,44 @@ func jsBlockBrace(prev jsToken, hasPrev bool) bool {
 	}
 	if prev.kind == jsWord {
 		switch prev.text {
-		case "else", "try", "finally", "do", "switch":
+		case "else", "try", "finally", "do", "switch", "catch", "class", "static":
 			return true
 		}
+	}
+	return false
+}
+
+// jsStatementBlockBrace 识别只看 '{' 前一个 Token 判断不出来的语句块：
+//   - class 主体：class A { / class A extends B {；
+//   - 标签语句与 case 子句之后的块：label: { … } / case 1: { … }。
+//
+// 把它们记成对象字面量，匹配的 '}' 就不会放行后面的正则字面量，行首的 /re/
+// 会被拆成两个除号。inBlock 表示当前最内层花括号是语句块。
+func jsStatementBlockBrace(prev jsToken, hasPrev bool, before jsToken, hasBefore bool, older jsToken, hasOlder, inBlock bool) bool {
+	if !hasPrev || !hasBefore {
+		return false
+	}
+	if prev.kind == jsWord && (before.text == "class" || before.text == "extends") {
+		return true
+	}
+	if prev.text != ":" {
+		return false
+	}
+	if hasOlder && older.text == "case" {
+		return true
+	}
+	if before.kind != jsWord {
+		return false
+	}
+	// 标签名之前必须是语句边界；对象字面量与三元表达式里的 a: { 不满足这一点。
+	if !hasOlder {
+		return true
+	}
+	switch older.text {
+	case ";", ":", ")", "else", "do", "=>", "}":
+		return true
+	case "{":
+		return inBlock
 	}
 	return false
 }
@@ -537,7 +695,7 @@ func (p *jsPrinter) run(tokens []jsToken) error {
 }
 
 func (p *jsPrinter) indent() string {
-	return p.base + strings.Repeat(jsIndent, p.depth)
+	return p.base + indentPrefix(jsIndent, p.depth)
 }
 
 func (p *jsPrinter) write(text string) {
@@ -630,6 +788,12 @@ func (p *jsPrinter) needsSpace(tok jsToken) bool {
 		return false
 	}
 
+	// 一元 '!' / '~' 后面紧接以 '=' 开头的 Token 时必须留空格，
+	// 否则两者会合并成 "!=" / "~="，再格式化一次 Token 就变了。
+	if (prev.text == "!" || prev.text == "~") && strings.HasPrefix(tok.text, "=") {
+		return true
+	}
+
 	switch prev.text {
 	case "(", "[", ".", "?.", "...", "#", "!":
 		return false
@@ -661,6 +825,11 @@ func (p *jsPrinter) needsSpace(tok jsToken) bool {
 		return !jsPostfixContext(prev, true)
 	case "+", "-":
 		if tok.unary {
+			// 一元正负号紧跟在另一个正负号之后时必须隔开，否则会并成 "++" / "--"：
+			// (+ +x) 变成 (++x)，含义从“正号的正号”变成了自增。
+			if prev.text == "+" || prev.text == "-" || prev.text == "++" || prev.text == "--" {
+				return true
+			}
 			return jsWordLike(prev)
 		}
 		return true

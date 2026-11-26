@@ -41,14 +41,20 @@ func formatCSS(src, base string) (string, error) {
 		return "", ErrEmptyDocument
 	}
 
+	tokens, err := tokenizeCSS(src)
+	if err != nil {
+		return "", err
+	}
 	p := &cssPrinter{base: base}
-	if err := p.run(tokenizeCSS(src)); err != nil {
+	if err := p.run(tokens); err != nil {
 		return "", err
 	}
 	return strings.TrimRight(p.out.String(), "\n"), nil
 }
 
-func tokenizeCSS(src string) []cssToken {
+// tokenizeCSS 切分 CSS。字符串或块注释没有闭合时返回 errInvalidCSS：排版器会给
+// 语句补分号，这种输入每格式化一次就多出一个 ';'，只能由调用方保留原文。
+func tokenizeCSS(src string) ([]cssToken, error) {
 	tokens := make([]cssToken, 0, len(src)/8+1)
 	space := false
 
@@ -63,10 +69,9 @@ func tokenizeCSS(src string) []cssToken {
 		if strings.HasPrefix(src[i:], "/*") {
 			end := strings.Index(src[i+2:], "*/")
 			if end < 0 {
-				end = len(src)
-			} else {
-				end += i + 4
+				return nil, errInvalidCSS
 			}
+			end += i + 4
 			tokens = append(tokens, cssToken{kind: cssComment, text: src[i:end], spaceBefore: space})
 			space = false
 			i = end
@@ -74,20 +79,9 @@ func tokenizeCSS(src string) []cssToken {
 		}
 
 		if ch == '"' || ch == '\'' {
-			j := i + 1
-			for j < len(src) {
-				if src[j] == '\\' {
-					j += 2
-					continue
-				}
-				if src[j] == ch {
-					j++
-					break
-				}
-				j++
-			}
-			if j > len(src) {
-				j = len(src)
+			j, closed := scanCSSString(src, i)
+			if !closed {
+				return nil, errInvalidCSS
 			}
 			tokens = append(tokens, cssToken{kind: cssString, text: src[i:j], spaceBefore: space})
 			space = false
@@ -142,7 +136,20 @@ func tokenizeCSS(src string) []cssToken {
 		i = j
 	}
 
-	return tokens
+	return tokens, nil
+}
+
+// scanCSSString 返回从 src[i] 开始的字符串字面量的结束下标，以及它是否闭合。
+func scanCSSString(src string, i int) (int, bool) {
+	quote := src[i]
+	for j := i + 1; j < len(src); j++ {
+		if src[j] == '\\' {
+			j++
+		} else if src[j] == quote {
+			return j + 1, true
+		}
+	}
+	return len(src), false
 }
 
 func isCSSSpace(ch byte) bool {
@@ -180,7 +187,9 @@ func (p *cssPrinter) run(tokens []cssToken) error {
 			if len(p.buf) == 0 {
 				return errInvalidCSS
 			}
-			p.writePrelude(p.buf)
+			if err := p.writePrelude(p.buf); err != nil {
+				return err
+			}
 			p.buf = p.buf[:0]
 			p.depth++
 
@@ -246,7 +255,7 @@ func (p *cssPrinter) run(tokens []cssToken) error {
 }
 
 func (p *cssPrinter) indent() string {
-	return p.base + strings.Repeat(cssIndent, p.depth)
+	return p.base + indentPrefix(cssIndent, p.depth)
 }
 
 func (p *cssPrinter) line(text string) {
@@ -255,16 +264,18 @@ func (p *cssPrinter) line(text string) {
 	p.out.WriteByte('\n')
 }
 
-func (p *cssPrinter) writePrelude(tokens []cssToken) {
+// writePrelude 输出选择器列表。列表里有空选择器（"a,{}"）时返回 errInvalidCSS：
+// 省略它会让输出变成 "a,\n}"，既不是合法 CSS，再格式化一次还会报错。
+func (p *cssPrinter) writePrelude(tokens []cssToken) error {
 	groups := splitCSSGroups(tokens)
 	if len(groups) == 0 {
 		p.line("{")
-		return
+		return nil
 	}
 	for i, group := range groups {
 		text := joinCSS(group)
 		if text == "" {
-			continue
+			return errInvalidCSS
 		}
 		if i < len(groups)-1 {
 			p.line(text + ",")
@@ -272,6 +283,7 @@ func (p *cssPrinter) writePrelude(tokens []cssToken) {
 			p.line(text + " {")
 		}
 	}
+	return nil
 }
 
 func (p *cssPrinter) writeStatement(tokens []cssToken) {
