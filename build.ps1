@@ -6,6 +6,20 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+
+# Invoke-Native 运行一条原生命令并返回它的退出码。
+# Windows PowerShell 5.1 在 $ErrorActionPreference = "Stop" 下会把原生命令写到 stderr 的
+# 每一行都变成终止性错误（NativeCommandError）；而 pwsh 7 又不会因非零退出码中止脚本。
+# 两种 shell 下都统一为：正常输出照常透传，成败只看退出码，由调用方判定。
+function Invoke-Native {
+    param([scriptblock]$Command)
+    $ErrorActionPreference = "Continue"
+    # 原生命令的输出必须直接写到宿主：一旦混入函数的输出流，返回值就不再是
+    # 单个退出码，调用方的 -ne 0 判断会变成对数组取非。
+    & $Command 2>&1 | ForEach-Object { Write-Host "$_" }
+    return $LASTEXITCODE
+}
+
 Write-Host ">>> Building gnote..." -ForegroundColor Cyan
 
 # 1. Ensure bin dir
@@ -26,7 +40,12 @@ if (-not $SkipTests) {
     Write-Host ">>> go vet ./..." -ForegroundColor Cyan
     # go vet 会因两条已知的 Win32 消息回调 lParam 指针还原告警返回非零退出码。
     # 只允许这两条固定诊断，其它任何输出（含编译错误）都必须失败。
+    # 采集期间必须放宽 $ErrorActionPreference（见 Invoke-Native 的说明），
+    # 否则 Windows PowerShell 5.1 会在第一条告警处终止脚本，白名单根本执行不到。
+    $ErrorActionPreference = "Continue"
     $vetOut = @(go vet ./... 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
+    $vetExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
     $unexpected = @($vetOut | Where-Object {
         $_ -notmatch '^window\\window\.go:\d+:\d+: possible misuse of unsafe\.Pointer$'
     })
@@ -37,14 +56,16 @@ if (-not $SkipTests) {
     }
 
     Write-Host ">>> go test ./..." -ForegroundColor Cyan
-    go test ./...
-    if ($LASTEXITCODE -ne 0) { exit 1 }
+    if ((Invoke-Native { go test ./... }) -ne 0) { exit 1 }
 }
 
 # 2. Compile Windows PE resource section (Icon + Manifest + VERSIONINFO)
 if (Get-Command windres -ErrorAction SilentlyContinue) {
     Write-Host ">>> Compiling PE resources (Icon + Manifest + VERSIONINFO)..." -ForegroundColor DarkGray
-    windres -i cmd/gnote/gnote.rc -O coff -o cmd/gnote/gnote_windows_amd64.syso
+    if ((Invoke-Native { windres -i cmd/gnote/gnote.rc -O coff -o cmd/gnote/gnote_windows_amd64.syso }) -ne 0) {
+        Write-Host ">>> windres failed; build aborted." -ForegroundColor Red
+        exit 1
+    }
 }
 
 # 3. Build main executable (-trimpath strips local paths, -H windowsgui hides console, -s -w reduces size)
@@ -55,7 +76,12 @@ if ($Debug) {
 }
 
 Write-Host ">>> Compiling gnote.exe..." -ForegroundColor Cyan
-go build -trimpath -ldflags="$ldflags" -o bin/gnote.exe ./cmd/gnote
+# 固定 CGO_ENABLED=0：无论机器上是否装有 C 编译器，产物都是同一个纯 Go 构建。
+$env:CGO_ENABLED = "0"
+if ((Invoke-Native { go build -trimpath -ldflags="$ldflags" -o bin/gnote.exe ./cmd/gnote }) -ne 0) {
+    Write-Host ">>> go build failed; bin/gnote.exe and gnote.exe were not updated." -ForegroundColor Red
+    exit 1
+}
 
 # 4. Optional: Authenticode code signing
 if ($Sign) {

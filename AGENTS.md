@@ -122,13 +122,16 @@ gnote/
 
 ### 3.1 核心编辑器引擎 (`component/textarea.go`)
 - **流式物理画笔累进排版**：采用连续物理画笔累进排版算法，彻底消除高亮加粗（Bold）或样式切换时由于字形微小膨胀造成的后续标记与字符重叠问题；
+- **合成粗体保持常规步进**：内嵌 `Gnote Mono` 没有粗体字面，GDI 合成加粗会把每个字形的步进加 1px（8–72px 各字号一致）；`render/font.go` 用 `'i'` / `'W'` / `'0'` 三个探针判定合成粗体，让编辑器字面（开启 `AlignSpace`）上的粗体字形沿用常规步进——墨迹可越出本格 1px 但不推移后续字形，折行、光标 X、命中测试与滚动上界因此与绘制保持同一基准；普通 UI 文本保持 GDI 原生排版；
 - **列对齐空格 (AlignSpace)**：内嵌 `Gnote Mono` 为等宽字体，空格/数字/字母步进一致、中文严格 2 格，1 空格 = 1 字符、`\t` 与 4 空格缩进 = 4 个英文字符；`graphics.Font.AlignSpace` 仍对编辑器字体开启，作为更换比例字体时的兜底（空格步进取数字 `0` 宽度），测量/绘制/折行/光标共用同一字形步进；
 - **智能平滑自动换行 (Word Wrap)**：支持按像素级精确折行，即使包含超长连续无空格文本或宽字符（中日韩），也保证严格在视口右侧平滑换行，绝不越界穿透；
+- **折行上界的宽字符阈值**：`lineFitsUpperBound` 把 `U+2000` 及以上的 rune 一律按宽格计：内嵌字体在 `U+2000–U+2FD5` 之间有 92 个两格码位（`①–⑩`、`Ⅰ–Ⅻ`、`★☆`、`※` 等）与 4 个 1.6 格码位，按 1 格计会让含这些符号的行越过折行边界被裁切；高估只会退回精确测量，短行不受影响；
 - **行级视口虚拟化 (Row Virtualization)**：仅对当前视口可见区域执行实际字形计算与光栅化混合，支持万行级别大文件丝滑滚动；
 - **增量视觉行索引 (Incremental Visual Index)**：`visualLines` / `logicalToVisual` 由 `visualState{clean,partial,full}` 驱动，编辑只重算受影响逻辑行的视觉分段并原地拼接，行数变化时仅平移尾部；`logicalToVisual` 追加末位哨兵（视觉行总数），普通按键不再 O(文档行数) 重建索引；
 - **增量排版缓存 (Incremental Layout)**：每个逻辑行只缓存整行像素宽度（8B/行），折行点在重建视觉行时按需计算并即时消费；等宽字体先用列数上界排除必然不折行的短行（不查字形），关闭折行的行宽在可见时按需测量；字体面与字形宽度缓存复用；
 - **超长行横向虚拟化**：关闭折行时为 ≥2048 列的行构建每 256 列的前缀宽度检查点；编辑只截断到编辑列、行尾输入增量续算；绘制时跳过视口外左右片段；
 - **高亮 spans 行缓存**：可见逻辑行的 `[]syntax.Span` 按行缓存（上限 512 行），编辑按失效起点删除、主题切换整体清空；重绘与光栅化不再重复分词；
+- **每次按键只分词一次**：单行编辑时 `invalidateHighlightForEdit` 为求行尾状态算出的片段经 `storeSpans` 直接进入缓存，随后的光标测量与绘制不再重新分词（20 万字符高亮行在行尾键入约 12.5ms → 6.7ms）；剩余的一次 O(行长) 分词需要增量词法器才能消除，行中编辑另有前缀检查点从编辑列重建到行尾的开销；
 - **高亮状态短路**：编辑后若行尾词法状态未变化，下游行的状态与 span 缓存保持有效，普通按键只重分词编辑行；
 - **零分配绘制路径**：`Canvas.DrawRunes` 直接消费 rune 切片，256 字符批量解析字形；行号槽用 `strconv.AppendInt` + 复用缓冲；光标 X 跨帧缓存并由 `measureEpoch` 失效；离屏字形只推进笔位；
 - **光标局部重绘**：窗口定时器通过 `TextArea.CaretRect` 取光标单元，`Window.renderRegion` 只光栅化并 BitBlt 该矩形；未实现该接口的控件回退整窗重绘；
@@ -141,6 +144,8 @@ gnote/
 - **焦点保持**：菜单打开时由 MenuLayer 独占键盘，关闭后恢复编辑器/查找框焦点；点击状态栏不会清除编辑区焦点，键盘输入与编辑器快捷键持续可用；
 - **行尾保真**：文档内部统一以 `\n` 存储，`SetLineEnding` / `GetTextWithEOL` 按原文件风格（CRLF/LF/CR，混合风格取主导者）序列化，保存不再擅自改写换行符；
 - **查找与替换**：`FindNext` / `FindAll` / `ReplaceCurrentSelection` / `ReplaceAll` 提供 rune 级匹配（可选大小写敏感）与自动回绕；`ReplaceAll` 以复合 `editOp` 批量提交，**整体只占一步撤销**；
+- **替换文本的换行归一**：`ReplaceAll` / `ReplaceCurrentSelection` 对替换文本做单遍、就地的 CRLF/CR → LF 归一（不含 CR 时零额外分配），多行替换不会把裸 `\r` 写进文档；全部替换的批量路径对每个被改动的行截断宽度检查点，超长行上的光标与命中不会错位；
+- **剪贴板写入结果如实返回**：`Copy` 返回写入的真实结果，剪贴板被其他程序占用时 `Cut` 不删除选区（`copyToClipboard` 可注入以便测试）；菜单与右键菜单的复制 / 剪切失败时状态栏提示 3 秒；
 - **鼠标选取**：单击定位、双击按 Unicode 单词边界选词（中文按连续文字选词）、三击选中整行；Shift+单击保留原锚点、把选区扩展到点击位置（`window` 层从鼠标消息 `wParam` 的 `MK_SHIFT`/`MK_CONTROL` 位填充修饰键）；右键不再移动光标；
 - **撤销合组**：相邻 700ms 内的连续单字符输入 / 退格 / Delete 合并为一步撤销（保存点与光标移动会打断合并），复合 `editOp` 保证多行反缩进、全部替换等批量操作同样单步可撤销；
 - **智能缩进**：回车自动复制当前行前导空白，前一个非空字符为 `{` 时额外缩进一级；`Shift+Tab` 对当前行或选区覆盖的所有行反缩进（单步撤销）；`Ctrl+Backspace` / `Ctrl+Delete` 删除单词，`Ctrl+←/→` 单词跳转，`Ctrl+Home/End` 文档首尾；
@@ -153,15 +158,21 @@ gnote/
 
 ### 3.2 自绘菜单栏与状态联动 (`cmd/gnote/app.go` & `component/menubar.go`)
 - **顶部菜单栏**：全客户区自绘 `MenuLayer`，文件/编辑/查看/设置/帮助五个菜单，查看菜单内嵌“主题”子菜单（八套主题单选勾选），支持一级子菜单、Alt+字母、F10、方向键、Esc、点击外部关闭与窄窗口翻转；菜单状态每次打开都从命令注册表重建，撤销/重做置灰与行号/换行/高亮/主题勾选实时生效；
+- **菜单栏交互与指针**：`MenuBar` 实现可选的 `HitTester` 接口（关闭时只占顶部条带，打开时占满客户区），`Panel.GetChildAt` 跳过在该点 `HitTest` 为假的子组件，编辑器与输入框的工字光标因此生效；菜单栏与可点击 `Label` 不再吞掉 `MouseUp`，拖选后在菜单栏或状态栏上松开不会留下粘滞选区；鼠标激活菜单项后的双击（1.2s 内、8px 内）由菜单栏消费，不漏进编辑器；父子菜单之间的间隙与斜向通道内子菜单保持展开；
 - **命令注册表**：`cmd/gnote/commands.go` 以 `Command{ID, Title, Accel, Run, Enabled, Checked}` 统一菜单、右键菜单与快捷键，禁止同一动作多处实现；
 - **独立设置窗口**：`cmd/gnote/settings_window.go` 使用 `Owner=主窗口, Modal=true` 的独立 HWND，TabBar 分组（编辑器/外观/关于），Switch/Segmented/Slider 控件；编辑器页可选择启动页面（介绍文档 / 空白页，`Settings.StartupPage`），外观页主题选择器由 `goui.Themes()` 动态生成并即时热预览，点击“应用”立即保存且窗口保持打开（页脚显示“已保存”），取消或直接关闭窗口回到上次应用的主题；
+- **设置文件容错与联动**：`parseSettings` 去掉 UTF-8 BOM 并逐字段宽松解析（数字接受 `18.0`、`2e1`、`"18"`，类型不符只丢该字段），解析失败时退出不回写原文件；窗口尺寸上限 16384；`settings.json` 作为文档在编辑器里打开时，退出与“打开配置文件”都不由内存回写，文档保存后重读磁盘并即时应用主题、字号、缩放、换行、行号与高亮；
 - **底部状态栏**：分段显示文件路径（超长省略）、`行:列 · 总行数`、编码、EOL、语言与缩放；后四段点击弹原生菜单（编码/EOL/语言/缩放）；窄窗口或高 DPI 下自动收起次要段，绝不重叠；
+- **高亮偏好的归属**：`highlightEnabled` 是全局偏好，只由“查看 → 语法高亮”与设置页修改并持久化；新建文档只是没有高亮器，状态栏的语言选择（含“纯文本”）只影响当前文档；
 - **右键上下文菜单**：原生 Win32 弹出菜单（`dialog.ShowPopupMenu`），提供撤销/重做、剪切/复制/粘贴、全选、查找/替换，按选区与撤销栈实时置灰；
+- **打开 / 保存对话框**：打开对话框的首个过滤器列出常见文本与代码扩展名（XML、INI、LOG、BAT、CMD、PS1、SH、CSV、Makefile 等）；另存为不再固定补 `.txt`，而是按所选过滤器补扩展名（`dialog.WithFilterExtension`），补全后的文件已存在时自行弹出覆盖确认；
 - **查找/替换条 (Ctrl+F / Ctrl+H, F3 下一个, Esc 关闭)**：`cmd/gnote/findbar.go` 提供增量查找、大小写开关、上一个/下一个、替换当前与全部替换；查找条与编辑器互斥持有键盘焦点，未处理按键不会串入正文；
-- **格式化文档 (Ctrl+Shift+F，菜单/右键共用 `cmdEditFormat`)**：仅对 `.json` / `.html` / `.htm` 启用；统一 4 空格缩进（与编辑器 Tab 一致）；JSON 使用 `encoding/json` token 级缩进，键顺序、数字字面量（大整数/高精度小数）与转义原样保留；HTML 使用纯 Go 分词器只重排块级标签缩进，`pre/textarea/svg/math` 内部逐字保留；内联 `<style>` / `<script>` 在 MIME 类型可识别时分别走 CSS/JS 格式化器（保留 `url(...)`、正则、模板字符串与 ASI 换行，解析失败或类型未知则回退原文）；整篇替换通过 `TextArea.ReplaceDocument` 提交为单步撤销，光标保持原逻辑行列；
-- **编码保真读写**：打开时自动识别 BOM / UTF-8 / UTF-16(LE/BE，含无 BOM 启发式) / 系统 ANSI 代码页（中文 Windows 即 GBK），二进制文件明确拒开；保存时按原编码回写（ANSI 下不可表示字符会提示并以 `?` 代替）；
-- **外部修改检测**：打开/保存成功后记录文件身份戳（存在性、大小、mtime），保存前若检测到文件被外部修改或删除，弹出确认对话框，绝不静默覆盖；
-- **原子保存**：先写同目录临时文件并 `Sync` 落盘，再原子替换目标文件，避免崩溃/断电/磁盘写满导致原文件被截断；单文件打开上限 64MB，超限给出明确提示；
+- **查找条的按键与焦点**：`Shift+F3` 上一个；“下一个”和“替换”先把防抖中的增量搜索落定再执行；查找条可见时用鼠标打开菜单不会把键盘焦点挪到编辑器，菜单关闭后输入仍进入查找框；查找框粘贴时去掉换行，替换框保留换行并归一为 LF；
+- **格式化文档 (Ctrl+Shift+F，菜单/右键共用 `cmdEditFormat`)**：仅对 `.json` / `.html` / `.htm` 启用；统一 4 空格缩进（与编辑器 Tab 一致；缩进深度上限 32，未闭合标签不再让输出二次方膨胀）；JSON 使用 `encoding/json` token 级缩进，键顺序、数字字面量（大整数/高精度小数）与转义原样保留；HTML 按分词状态扫描标签（未加引号属性值里的引号是普通字符），只重排块级标签缩进，`pre` / `script` / `style` 逐字保留并只对齐独占一行的首尾标签，`textarea` / `svg` / `math` / `xmp` / `listing` 与带 `white-space: pre*` 内联样式的元素整体逐字保留、闭合标签不重缩进，与相邻内容紧贴的行内元素和注释不插入换行，不换行空格（NBSP）按正文对待；内联 `<style>` / `<script>` 在 MIME 类型可识别时分别走 CSS/JS 格式化器（保留 `url(...)`、正则、模板字符串与 ASI 换行；JS 的 `/` 只在除法读法不成立时才按正则保留，`catch {}`、类体、标签与 `case` 之后的块、注释前面的 `{` 都按语句块处理），解析失败或类型未知则回退原文；标签在文件结束前没有 `>` 时整体报错、不改写文档；整篇替换通过 `TextArea.ReplaceDocument` 提交为单步撤销，光标保持原逻辑行列；
+- **编码保真读写**：打开时自动识别 BOM / UTF-8 / UTF-16(LE/BE，含无 BOM 启发式) / 系统 ANSI 代码页（中文 Windows 即 GBK），二进制文件明确拒开；`textio.DecodeDetailed` 同时报告解码能否逐字节还原（`Lossless`）：主体是 UTF-8、仅含孤立坏字节的文件按 UTF-8 打开（坏字节显示为 U+FFFD），不再整篇落入 GBK；系统 ACP 为 65001（UTF-8 Beta）时改用系统区域的传统 ANSI 代码页；无 BOM 的 UTF-16 记住无 BOM（`Encoding.NoBOM`），未编辑的保存逐字节一致；
+- **保存前的改写确认**：`saveWarning` 把「载入时有解不开的字节」「载入后切换过编码」「有字符无法用目标编码表示（将以 `?` 写出）」合成一次确认，取消则什么都不动，写出成功后不再重复询问；判定与原生对话框解耦（`savePrompt` 可替换）以便单测；
+- **外部修改检测**：打开/保存成功后记录文件身份戳（存在性、大小、mtime，取读取之前的那次 `Stat`），保存前若检测到文件被外部修改或删除，弹出确认对话框，绝不静默覆盖；另存为到当前路径同样检查；
+- **原子保存**：先写同目录临时文件并 `Sync` 落盘，再原子替换目标文件，避免崩溃/断电/磁盘写满导致原文件被截断；替换前把原文件的 EFS 加密与 NTFS 压缩（写内容之前）、隐藏 / 系统属性、创建时间、备用数据流与显式 DACL 搬到临时文件，加密无法重建时取消保存而不落明文；跟随符号链接到最终路径；多硬链接文件改为原地覆写（写满落盘后再截断），避免其它名字留在旧内容上；只读目标直接拒绝，瞬时占用按 20/40/80/160ms 重试，错误说明不暴露临时文件路径；单文件打开上限 64MB，超限给出明确提示；
 - **生命周期关闭拦截**：挂载 `Window.SetOnClose` 钩子，当存在未保存脏修改时，拦截红叉、Alt+F4 或关闭动作，弹出“是否将更改保存”的原生对话框（支持是/否/取消三态分支）。
 
 ### 3.3 极简风格图标与 Windows PE 资源嵌入 (`cmd/gnote/icon.go` & `icon.ico`)
@@ -206,8 +217,8 @@ gnote/
 | **文本编辑** | `TextArea` | `NewTextArea()`, `FindNext()`, `ReplaceAll()`, `ReplaceDocument()`, `ImeAnchor()` | 多行文本编辑、自动折行、行号槽、高亮器接入、查找替换、整篇替换与 IME 组合串/光标锚点 |
 | **字形缓存** | `Glyph`, `FontFace` | `SaveGlyphCaches()`, `RegisterMemoryFont()` | 已光栅化字形 AlphaMask 按字体指纹/字号落盘并跨进程复用 |
 | **文档格式化** | `format.Kind` | `KindForPath()`, `Format()`, `FormatJSON()`, `FormatHTML()` | JSON token 级缩进（键序/数字字面量不变）与 HTML 块级排版（pre/script/style/textarea 原文保留） |
-| **高亮体系** | `Highlighter`, `Span` | `DetectHighlighter()`, `GetLanguageName()` | 16 种编程语言的纯 Go 状态机词法分词与样式生成 |
-| **系统窗口** | `Window`, `WindowConfig` | `NewWindow()`, `SetOnClose()`, `Activate()`, `Run()` | 零 CGO 窗口创建、DIBSection 双缓冲、owner/modal、系统键分发与退出拦截 |
+| **高亮体系** | `Highlighter`, `Span` | `DetectHighlighter()`, `GetLanguageName()` | 16 种编程语言的纯 Go 状态机词法分词与样式生成；跨行状态编码：Rust 原生字符串为 `StateRustRawString + '#' 数`，Markdown 围栏为 `StateFencedCodeBlock + 2×(围栏长度−3) + (波浪线)`，CSS 为 `2×花括号深度 + 奇偶位`（奇数表示块注释中） |
+| **系统窗口** | `Window`, `WindowConfig` | `NewWindow()`, `SetOnClose()`, `Activate()`, `Run()`, `GetSize()`, `IsMaximized()` | 零 CGO 窗口创建、DIBSection 双缓冲、owner/modal、系统键分发与退出拦截；`GetSize()` 返回还原状态下的客户区尺寸（最大化 / 最小化期间不覆盖），创建时把尺寸与位置收进显示器工作区，最小窗口尺寸随 DPI 缩放；修饰键区分左右，AltGr（右 Alt + 左 Ctrl）不报成 Ctrl+Alt |
 | **容器与布局** | `Panel`, `BorderLayout`, `FlowLayout` | `NewSurfacePanel()`, `NewBackgroundPanel()` | 顶层及局部容器排版、反向 Z-Index 事件冒泡与视口裁剪 |
 | **文本编码** | `textio.Encoding`, `textio.EOL`, `textio.Stamp` | `Decode()`, `Encode()`, `AnalyzeEOL()`, `Stat()` | BOM/UTF-8/UTF-16/ANSI 代码页双向编解码、换行风格分析与文件外部修改检测 |
 | **原生能力** | `clipboard`, `dialog` | `GetText()`, `SetText()`, `OpenFileDialog()`, `SaveFileDialog()` | 零 CGO Windows 剪贴板 UTF-16 文本读写与原生文件系统对话框集成 |
@@ -239,6 +250,8 @@ go build -trimpath -ldflags="-H windowsgui -s -w" -o bin/gnote.exe ./cmd/gnote
 > - `-w`：剥离 DWARF 调试信息，进一步缩减体积、加速装载；
 > - `-Sign`：使用 Authenticode 为可执行程序赋予数字签名；
 > - `-Package`：生成免安装绿色发布压缩包并附带 MOTW 一键解除脚本。
+>
+> `build.ps1` 通过 `Invoke-Native` 统一按退出码判定原生命令的成败（输出直接写到宿主），Windows PowerShell 5.1 与 pwsh 7 行为一致：vet 门禁采集输出时临时放宽 `$ErrorActionPreference`，`windres` / `go build` 失败即中止且不覆盖旧产物；构建固定 `CGO_ENABLED=0`。
 
 ### 5.2 调试模式编译 (保留终端标准输出/错误回显)
 ```powershell
@@ -255,7 +268,7 @@ windres -i cmd/gnote/gnote.rc -O coff -o cmd/gnote/gnote_windows_amd64.syso
 ### 5.4 质量门禁与回归基线 (本地 `build.ps1`，仓库不依赖远程 CI)
 - **gofmt**：`gofmt -l .` 必须为空；`.gitattributes` 已把工作树统一为 LF，避免 Windows CRLF 误报；
 - **go vet**：除 `window/window.go` 中两条 Win32 消息回调 `lParam` 指针还原告警（源码已注释说明）外，不允许任何输出；
-- **测试**：`go test ./...`（含高亮器 fuzz 种子语料、剪贴板真实往返、视觉行索引一致性、主题对比度）；
+- **测试**：`go test ./...`（含高亮器 fuzz 种子语料、剪贴板真实往返、视觉行索引一致性、主题对比度）；`go test -race ./...` 全包可用（window 包测试借 `lParam` 传入的结构必须放在包级变量，否则 checkptr 报错）；
 - **构建**：`go build -trimpath -ldflags="-H windowsgui -s -w"`；
 - `./build.ps1` 默认依次执行以上四项，`-SkipTests` 可按需跳过；
 - **性能基线**：`component/bench_test.go` 提供渲染/按键/回车/高亮/序列化/装载/撤销/全部替换/缩放/长行光标十组基准，全部开启 `ReportAllocs`；`go test ./component -run '^$' -bench . -benchtime 5x` 作为冒烟门禁。
