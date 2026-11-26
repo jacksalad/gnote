@@ -211,19 +211,27 @@ func (p *Panel) GetChildren() []Component {
 	return p.children
 }
 
-// GetChildAt 获取指定位置的子组件
+// GetChildAt 获取指定位置的子组件（在该点不命中的 HitTester 覆盖层不算占据该点）
 func (p *Panel) GetChildAt(x, y int32) Component {
 	// 从后向前遍历（后添加的组件在上层）
 	for i := len(p.children) - 1; i >= 0; i-- {
 		child := p.children[i]
 		if child.IsVisible() {
 			bounds := child.GetBounds()
-			if IsInBounds(x, y, bounds) {
+			if IsInBounds(x, y, bounds) && childOccupies(child, x, y) {
 				return child
 			}
 		}
 	}
 	return nil
+}
+
+// childOccupies 判断子组件是否真正占据该点：未实现 HitTester 的组件以 bounds 为准
+func childOccupies(child Component, x, y int32) bool {
+	if tester, ok := child.(HitTester); ok {
+		return tester.HitTest(x, y)
+	}
+	return true
 }
 
 // SetBackground 设置背景颜色

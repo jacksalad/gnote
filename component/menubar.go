@@ -1,6 +1,8 @@
 package component
 
 import (
+	"time"
+
 	"github.com/jacksalad/gnote/event"
 	"github.com/jacksalad/gnote/graphics"
 	"github.com/jacksalad/gnote/render"
@@ -49,12 +51,21 @@ type MenuBar struct {
 	focus        int
 	submenuOpen  int
 	submenuFocus int
-	focused      bool
+	// 子菜单父项内最近的指针位置及其所在项，见 inSubmenuLane
+	submenuFrom     graphics.Point
+	submenuFromItem int
+	submenuFromSet  bool
+	focused         bool
 
 	onOpenChange func(open bool)
 
 	barWidths  []int32
 	menuWidths []int32
+
+	// 最近一次由鼠标按下激活菜单项的时间与位置，见 ownsDoubleClick
+	activatedAt time.Time
+	activatedX  int32
+	activatedY  int32
 
 	// 主题色
 	barBg       graphics.Color
@@ -282,11 +293,16 @@ func (m *MenuBar) OnEvent(evt event.Event) bool {
 		return m.handleMouseDown(data)
 
 	case event.EventMouseUp:
-		if m.open >= 0 {
-			return true
-		}
+		// 菜单栏没有依赖释放的动作（菜单项按下即执行），不消费 MouseUp：
+		// 截住它会让正在拖选的编辑器收不到释放事件，选区在没有按键时继续跟随鼠标。
+		return false
+
+	case event.EventMouseDoubleClick:
 		data, ok := evt.Data.(event.MouseData)
-		return ok && m.pointInBar(data.Y)
+		if !ok {
+			return false
+		}
+		return m.ownsDoubleClick(data)
 
 	case event.EventKeyDown:
 		key, ok := evt.Data.(event.KeyData)
@@ -311,6 +327,12 @@ func (m *MenuBar) OnEvent(evt event.Event) bool {
 
 func (m *MenuBar) pointInBar(y int32) bool {
 	return y >= m.bounds.Y && y < m.bounds.Y+m.barHeight
+}
+
+// HitTest 实现 HitTester：菜单打开时占据整个客户区，关闭时只占顶部菜单栏条带。
+// bounds 铺满客户区是为了让下拉覆盖编辑器，按位置命中的查询（如光标查找）必须据此穿透。
+func (m *MenuBar) HitTest(x, y int32) bool {
+	return m.open >= 0 || m.pointInBar(y)
 }
 
 func (m *MenuBar) handleMouseMove(data event.MouseData) bool {
@@ -339,11 +361,25 @@ func (m *MenuBar) handleMouseMove(data event.MouseData) bool {
 
 	// 子菜单 hover
 	if m.submenuOpen >= 0 {
+		// 指针在子菜单父项内移动时持续更新通道顶点：先横移再斜向离开父项也要落在通道里
+		if j := m.menuRowAt(data.X, data.Y); j == m.submenuOpen {
+			m.noteSubmenuFrom(j, data.X, data.Y)
+		}
 		if j := m.submenuRowAt(data.X, data.Y); j >= 0 {
 			if j != m.submenuFocus {
 				m.submenuFocus = j
 				return true
 			}
+			return false
+		}
+		// 子菜单自身的内边距（行与边框之间的 4px）不算移出子菜单
+		if containsRect(m.submenuRect(m.open, m.submenuOpen), data.X, data.Y) {
+			return false
+		}
+		// 父弹出层与子菜单之间的间隙，以及从父菜单项斜向移向子菜单的通道：
+		// 鼠标正从父菜单项移向子菜单，保持子菜单展开
+		if containsRect(m.submenuBridge(m.open, m.submenuOpen), data.X, data.Y) ||
+			m.inSubmenuLane(data.X, data.Y) {
 			return false
 		}
 	}
@@ -357,6 +393,7 @@ func (m *MenuBar) handleMouseMove(data event.MouseData) bool {
 			if m.submenuOpen != j {
 				m.submenuOpen = j
 				m.submenuFocus = firstSelectable(items[j].Submenu)
+				m.noteSubmenuFrom(j, data.X, data.Y)
 				changed = true
 			}
 		} else if m.submenuOpen >= 0 {
@@ -401,6 +438,7 @@ func (m *MenuBar) handleMouseDown(data event.MouseData) bool {
 			items := m.menus[m.open].Items[m.submenuOpen].Submenu
 			item := items[j]
 			if !item.Disabled {
+				m.noteMouseActivation(data.X, data.Y)
 				m.activate(item)
 			}
 			return true
@@ -418,8 +456,10 @@ func (m *MenuBar) handleMouseDown(data event.MouseData) bool {
 			m.focus = j
 			m.submenuOpen = j
 			m.submenuFocus = firstSelectable(item.Submenu)
+			m.noteSubmenuFrom(j, data.X, data.Y)
 			return true
 		}
+		m.noteMouseActivation(data.X, data.Y)
 		m.activate(item)
 		return true
 	}
@@ -544,6 +584,38 @@ func (m *MenuBar) activate(item MenuEntry) {
 	if onClick != nil {
 		onClick()
 	}
+}
+
+// noteMouseActivation 记录鼠标按下激活菜单项的时间与位置，供 ownsDoubleClick 认领紧随其后的双击。
+func (m *MenuBar) noteMouseActivation(x, y int32) {
+	m.activatedAt, m.activatedX, m.activatedY = time.Now(), x, y
+}
+
+// 双击认领窗口：系统双击间隔在控制面板中最长 900ms；位置容差取系统双击矩形（默认 4px）的宽松值，
+// 只吞掉落在刚才激活点上的双击，不影响正文里其它位置的双击选词。
+const (
+	doubleClickGrace     = 1200 * time.Millisecond
+	doubleClickTolerance = int32(8)
+)
+
+// ownsDoubleClick 判断一次双击是否属于菜单栏。菜单打开或双击落在菜单栏条带内时一律消费；
+// 菜单项按下即执行，弹出层消失后双击的第二次点击（WM_LBUTTONDBLCLK）落在刚才的激活点上，
+// 也必须由菜单栏吞掉，否则会穿透到下层编辑器抢焦点、选词。
+func (m *MenuBar) ownsDoubleClick(data event.MouseData) bool {
+	if m.open >= 0 || m.pointInBar(data.Y) {
+		return true
+	}
+	if data.Button != event.MouseButtonLeft || time.Since(m.activatedAt) > doubleClickGrace {
+		return false
+	}
+	return absSub(data.X, m.activatedX) <= doubleClickTolerance && absSub(data.Y, m.activatedY) <= doubleClickTolerance
+}
+
+func absSub(a, b int32) int32 {
+	if a > b {
+		return a - b
+	}
+	return b - a
 }
 
 func (m *MenuBar) switchMenu(delta int) {
@@ -773,15 +845,7 @@ func (m *MenuBar) submenuRect(menuIndex, itemIndex int) graphics.Rect {
 	item := m.menus[menuIndex].Items[itemIndex]
 	w := m.measureSubmenuWidth(item.Submenu)
 	h := m.entriesHeight(item.Submenu)
-
-	rowY := parent.Y + 4
-	for i := 0; i < itemIndex; i++ {
-		if m.menus[menuIndex].Items[i].Separator {
-			rowY += m.separatorGap
-		} else {
-			rowY += m.rowHeight
-		}
-	}
+	rowY := m.entryTop(parent, m.menus[menuIndex].Items, itemIndex)
 
 	x := parent.X + parent.Width + 2
 	if x+w > m.bounds.X+m.bounds.Width-2 {
@@ -798,6 +862,93 @@ func (m *MenuBar) submenuRect(menuIndex, itemIndex int) graphics.Rect {
 		y = m.bounds.Y + m.barHeight + 2
 	}
 	return graphics.NewRect(x, y, w, h)
+}
+
+// entryTop 返回弹出层中第 index 项的顶边
+func (m *MenuBar) entryTop(popup graphics.Rect, items []MenuEntry, index int) int32 {
+	rowY := popup.Y + 4
+	for i := 0; i < index; i++ {
+		if items[i].Separator {
+			rowY += m.separatorGap
+		} else {
+			rowY += m.rowHeight
+		}
+	}
+	return rowY
+}
+
+// submenuBridge 返回父弹出层与子菜单之间的连接带：横向为两者的 2px 间隙，纵向取子菜单
+// 与父菜单项的并集。子菜单翻转到左侧时间隙位于父弹出层左边；两者重叠时返回空矩形。
+// 没有它，鼠标从父菜单项移向子菜单时经过的间隙点既不在弹出层也不在子菜单内，子菜单会被收起。
+func (m *MenuBar) submenuBridge(menuIndex, itemIndex int) graphics.Rect {
+	parent := m.menuRect(menuIndex)
+	sub := m.submenuRect(menuIndex, itemIndex)
+	items := m.menus[menuIndex].Items
+	rowTop := m.entryTop(parent, items, itemIndex)
+
+	top, bottom := sub.Y, sub.Y+sub.Height
+	if rowTop < top {
+		top = rowTop
+	}
+	if rowBottom := rowTop + m.rowHeight; rowBottom > bottom {
+		bottom = rowBottom
+	}
+	switch {
+	case sub.X >= parent.X+parent.Width:
+		return graphics.NewRect(parent.X+parent.Width, top, sub.X-(parent.X+parent.Width), bottom-top)
+	case sub.X+sub.Width <= parent.X:
+		return graphics.NewRect(sub.X+sub.Width, top, parent.X-(sub.X+sub.Width), bottom-top)
+	}
+	return graphics.Rect{}
+}
+
+// submenuLaneTolerance 安全通道顶点处的纵向容差，吸收鼠标采样的抖动
+const submenuLaneTolerance = int32(4)
+
+// noteSubmenuFrom 记录子菜单父项（第 item 项）内的指针位置，作为安全通道的顶点。
+func (m *MenuBar) noteSubmenuFrom(item int, x, y int32) {
+	m.submenuFrom = graphics.Point{X: x, Y: y}
+	m.submenuFromItem, m.submenuFromSet = item, true
+}
+
+// inSubmenuLane 报告指针是否仍在“从父菜单项走向子菜单”的通道内：
+// 顶边是父菜单项内最近的指针位置（上下各放宽 submenuLaneTolerance），底边是子菜单靠近父弹出层的一侧。
+// 斜向移动会先越过父菜单项的上/下边缘，经过弹出层内边距或层外区域——这些点不属于任何一行，
+// 会被当成“移出菜单”而收起子菜单。直接向下或向左离开父菜单项不在通道内，照旧收起。
+func (m *MenuBar) inSubmenuLane(x, y int32) bool {
+	parent := m.menuRect(m.open)
+	sub := m.submenuRect(m.open, m.submenuOpen)
+	apex := m.submenuFrom
+	if !m.submenuFromSet || m.submenuFromItem != m.submenuOpen {
+		// 键盘展开：没有指针位置，以父菜单项中心为顶点
+		rowTop := m.entryTop(parent, m.menus[m.open].Items, m.submenuOpen)
+		apex = graphics.Point{X: parent.X + parent.Width/2, Y: rowTop + m.rowHeight/2}
+	}
+	baseX := sub.X
+	if apex.X >= sub.X+sub.Width {
+		baseX = sub.X + sub.Width
+	}
+	return pointInConvexQuad(graphics.Point{X: x, Y: y}, [4]graphics.Point{
+		{X: apex.X, Y: apex.Y - submenuLaneTolerance},
+		{X: apex.X, Y: apex.Y + submenuLaneTolerance},
+		{X: baseX, Y: sub.Y + sub.Height},
+		{X: baseX, Y: sub.Y},
+	})
+}
+
+// pointInConvexQuad 用叉积符号一致性判断点是否在凸四边形内（顶点按顺序给出，边界算在内）
+func pointInConvexQuad(p graphics.Point, quad [4]graphics.Point) bool {
+	var pos, neg bool
+	for i := range quad {
+		a, b := quad[i], quad[(i+1)%4]
+		cross := (b.X-a.X)*(p.Y-a.Y) - (b.Y-a.Y)*(p.X-a.X)
+		if cross > 0 {
+			pos = true
+		} else if cross < 0 {
+			neg = true
+		}
+	}
+	return !(pos && neg)
 }
 
 func (m *MenuBar) submenuRowAt(x, y int32) int {

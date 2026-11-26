@@ -1086,3 +1086,85 @@ const (
 	WM_SETCURSOR = 0x0020
 	HTCLIENT     = 1
 )
+
+// 左右区分的修饰键虚拟键码（AltGr 识别依赖它们：系统把 AltGr 报告为左 Ctrl + 右 Alt）
+const (
+	VK_LSHIFT   = 0xA0
+	VK_RSHIFT   = 0xA1
+	VK_LCONTROL = 0xA2
+	VK_RCONTROL = 0xA3
+	VK_LMENU    = 0xA4
+	VK_RMENU    = 0xA5
+)
+
+// 显示器选择与 WM_SIZE 显示状态
+const (
+	MONITOR_DEFAULTTOPRIMARY = 1
+	MONITOR_DEFAULTTONEAREST = 2
+
+	SIZE_RESTORED  = 0
+	SIZE_MINIMIZED = 1
+	SIZE_MAXIMIZED = 2
+
+	SM_CXVIRTUALSCREEN = 78
+	SM_CYVIRTUALSCREEN = 79
+)
+
+// 显示器与窗口状态 Win32 API
+var (
+	monitorFromWindow = user32.NewProc("MonitorFromWindow")
+	monitorFromRect   = user32.NewProc("MonitorFromRect")
+	getMonitorInfoW   = user32.NewProc("GetMonitorInfoW")
+	isZoomed          = user32.NewProc("IsZoomed")
+)
+
+// MONITORINFO 显示器信息（RcWork 为排除任务栏后的工作区）
+type MONITORINFO struct {
+	CbSize    uint32
+	RcMonitor RECT
+	RcWork    RECT
+	DwFlags   uint32
+}
+
+// IsZoomed 判断窗口是否处于最大化状态
+func IsZoomed(hWnd uintptr) bool {
+	ret, _, _ := isZoomed.Call(hWnd)
+	return ret != 0
+}
+
+// PrimaryWorkArea 返回主显示器工作区（排除任务栏）的屏幕坐标
+func PrimaryWorkArea() (RECT, bool) {
+	mon, _, _ := monitorFromWindow.Call(0, MONITOR_DEFAULTTOPRIMARY)
+	return monitorWorkArea(mon)
+}
+
+// WorkAreaNear 返回最靠近点 (x, y) 的显示器的工作区
+func WorkAreaNear(x, y int32) (RECT, bool) {
+	// 坐标先收进安全范围，避免极端配置值让 x+1 溢出
+	point := RECT{Left: clampInt32(x, -(1 << 30), 1<<30), Top: clampInt32(y, -(1 << 30), 1<<30)}
+	point.Right, point.Bottom = point.Left+1, point.Top+1
+	mon, _, _ := monitorFromRect.Call(uintptr(unsafe.Pointer(&point)), MONITOR_DEFAULTTONEAREST)
+	return monitorWorkArea(mon)
+}
+
+// WindowWorkArea 返回窗口所在显示器的工作区
+func WindowWorkArea(hWnd uintptr) (RECT, bool) {
+	mon, _, _ := monitorFromWindow.Call(hWnd, MONITOR_DEFAULTTONEAREST)
+	return monitorWorkArea(mon)
+}
+
+func monitorWorkArea(monitor uintptr) (RECT, bool) {
+	if monitor == 0 {
+		return RECT{}, false
+	}
+	mi := MONITORINFO{CbSize: uint32(unsafe.Sizeof(MONITORINFO{}))}
+	ret, _, _ := getMonitorInfoW.Call(monitor, uintptr(unsafe.Pointer(&mi)))
+	if ret == 0 {
+		return RECT{}, false
+	}
+	return mi.RcWork, true
+}
+
+func clampInt32(v, lo, hi int32) int32 {
+	return max(lo, min(hi, v))
+}

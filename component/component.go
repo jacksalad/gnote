@@ -167,6 +167,13 @@ type Clickable interface {
 	IsPressed() bool
 }
 
+// HitTester 可选接口：组件声明点 (x, y) 是否由自己占据。默认只看 bounds；
+// 铺满客户区的覆盖层（如 MenuBar 关闭时只占顶部菜单栏条带）实现它，
+// 让 GetChildAt 这类按位置命中的查询穿透到下层组件。
+type HitTester interface {
+	HitTest(x, y int32) bool
+}
+
 // TextComponent 文本组件接口
 type TextComponent interface {
 	Component

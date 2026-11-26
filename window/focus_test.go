@@ -11,6 +11,9 @@ import (
 	"github.com/jacksalad/gnote/event"
 )
 
+// dpiChangedRect 是 WM_DPICHANGED 测试借 lParam 传入的矩形，必须是包级变量，见 TestWindow_DpiChangedEvent。
+var dpiChangedRect RECT
+
 func TestWindow_FocusRestoredOnActivation(t *testing.T) {
 	win, err := NewWindow(WindowConfig{Title: "Focus Test", Width: 400, Height: 300, Visible: false})
 	if err != nil {
@@ -62,8 +65,12 @@ func TestWindow_DpiChangedEvent(t *testing.T) {
 
 	old := win.GetDPI()
 	newDpi := old + 48
-	rect := RECT{Left: 0, Top: 0, Right: 500, Bottom: 400}
-	SendMessage(win.Hwnd(), WM_DPICHANGED, uintptr(newDpi), uintptr(unsafe.Pointer(&rect)))
+	// lParam 借测试传入的矩形必须放在静态数据区：(*T)(unsafe.Pointer(uintptr)) 没有
+	// “原始指针”，checkptr（-race 默认开启）只要发现还原出的地址落在 Go 的堆或栈
+	// 分配里就判非法，局部变量会让本包无法用 -race 检测。真实消息的 lParam 指向
+	// 系统内存，不受影响。
+	dpiChangedRect = RECT{Left: 0, Top: 0, Right: 500, Bottom: 400}
+	SendMessage(win.Hwnd(), WM_DPICHANGED, uintptr(newDpi), uintptr(unsafe.Pointer(&dpiChangedRect)))
 
 	select {
 	case data := <-got:

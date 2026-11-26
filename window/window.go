@@ -161,7 +161,8 @@ func NewWindow(config WindowConfig) (*Window, error) {
 
 	// 计算窗口大小（根据当前系统 DPI 自动调整边框，防止高分屏尺寸裁剪与失真）
 	sysDpi := GetDpiForSystem()
-	rect := RECT{Left: 0, Top: 0, Right: config.Width, Bottom: config.Height}
+	clientW, clientH := capToVirtualScreen(config.Width, config.Height)
+	rect := RECT{Left: 0, Top: 0, Right: clientW, Bottom: clientH}
 	AdjustWindowRectExForDpi(&rect, dwStyle, false, 0, sysDpi)
 	windowWidth := rect.Right - rect.Left
 	windowHeight := rect.Bottom - rect.Top
@@ -211,6 +212,9 @@ func NewWindow(config WindowConfig) (*Window, error) {
 		return nil, ErrCreateWindowFailed
 	}
 
+	// 把尺寸与位置收进目标显示器的工作区（排除任务栏）。窗口此刻仍隐藏，调整不会闪烁。
+	clampToWorkArea(hwnd, config.Center, posX, posY, windowWidth, windowHeight)
+
 	winDpi := GetDpiForWindow(hwnd)
 	if winDpi == 0 {
 		winDpi = sysDpi
@@ -229,6 +233,11 @@ func NewWindow(config WindowConfig) (*Window, error) {
 		ownerWin:        owner,
 		modal:           config.Modal && owner != nil,
 		uiThreadID:      GetCurrentThreadID(),
+	}
+	// 以系统最终接受的客户区尺寸为准：上面的收敛与系统自身的尺寸限制都可能让实际尺寸小于请求值，
+	// 否则 GetSize() 会一直回报一个达不到的尺寸并被持久化。
+	if client := GetClientRect(hwnd); client.Right > 0 && client.Bottom > 0 {
+		w.config.Width, w.config.Height = client.Right, client.Bottom
 	}
 
 	// 初始化并应用窗口图标
@@ -260,6 +269,58 @@ func NewWindow(config WindowConfig) (*Window, error) {
 	}
 
 	return w, nil
+}
+
+// capToVirtualScreen 把请求的客户区尺寸限制在 [0, 虚拟屏幕] 内：
+// 损坏或手工编辑过的配置可能带着接近 int32 上下限的数字，不能原样参与边框换算。
+func capToVirtualScreen(width, height int32) (int32, int32) {
+	if width < 0 {
+		width = 0
+	}
+	if height < 0 {
+		height = 0
+	}
+	if vw := GetSystemMetrics(SM_CXVIRTUALSCREEN); vw > 0 && width > vw {
+		width = vw
+	}
+	if vh := GetSystemMetrics(SM_CYVIRTUALSCREEN); vh > 0 && height > vh {
+		height = vh
+	}
+	return width, height
+}
+
+// clampToWorkArea 把窗口的外框矩形收进目标显示器的工作区（排除任务栏）：
+// 尺寸不超过工作区，越界时做最小位移让窗口整个落在工作区内。
+// 配置里的尺寸可能来自更大的屏幕或最大化状态，越界窗口的状态栏会被压在任务栏下面。
+// primary 为 true 时目标是主显示器（与居中逻辑一致），否则是最靠近 (x, y) 的显示器。
+func clampToWorkArea(hwnd uintptr, primary bool, x, y, width, height int32) {
+	var work RECT
+	var ok bool
+	if primary {
+		work, ok = PrimaryWorkArea()
+	} else {
+		work, ok = WorkAreaNear(x, y)
+	}
+	workW, workH := work.Right-work.Left, work.Bottom-work.Top
+	if !ok || workW <= 0 || workH <= 0 {
+		return
+	}
+	width, height = min(width, workW), min(height, workH)
+
+	// 先把起点收进工作区，随后的 x+width 才不会溢出
+	x = clampInt32(x, work.Left, work.Right)
+	y = clampInt32(y, work.Top, work.Bottom)
+	if x+width > work.Right {
+		x = work.Right - width
+	}
+	if y+height > work.Bottom {
+		y = work.Bottom - height
+	}
+
+	rect := GetWindowRect(hwnd)
+	if rect.Left != x || rect.Top != y || rect.Right-rect.Left != width || rect.Bottom-rect.Top != height {
+		SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER|SWP_NOACTIVATE)
+	}
 }
 
 // rebuildBackBuffer 确保存在覆盖请求尺寸的 DIB 后备缓冲区；失败时保留旧缓冲区并返回 false。
@@ -678,12 +739,52 @@ func ApplyThemeToAllWindows(t *theme.Theme) {
 	}
 }
 
+// modifierState 左右分开记录的修饰键按下状态
+type modifierState struct {
+	lShift, rShift bool
+	lCtrl, rCtrl   bool
+	lAlt, rAlt     bool
+}
+
+// readModifiers 读取当前修饰键状态（区分左右：Windows 把 AltGr 报告为左 Ctrl + 右 Alt）
+func readModifiers() modifierState {
+	down := func(vk int) bool { return int32(GetKeyState(vk))&0x8000 != 0 }
+	return modifierState{
+		lShift: down(VK_LSHIFT), rShift: down(VK_RSHIFT),
+		lCtrl: down(VK_LCONTROL), rCtrl: down(VK_RCONTROL),
+		lAlt: down(VK_LMENU), rAlt: down(VK_RMENU),
+	}
+}
+
+// isAltGr 报告 AltGr 是否按下：Windows 把 AltGr 报告为“左 Ctrl + 右 Alt”同时按下，
+// 且左 Alt 与右 Ctrl 均未按下。European 布局靠它输入 @ € ą 等字符。
+func (s modifierState) isAltGr() bool {
+	return s.rAlt && s.lCtrl && !s.lAlt && !s.rCtrl
+}
+
+// modifiers 把按键状态换算成事件携带的修饰键。AltGr 不是 Ctrl+Alt：
+// 否则 AltGr+E 会打开“编辑”菜单，AltGr 的 Ctrl+A/C/X/V/Z 分支会抢走本该输入的字符。
+func (s modifierState) modifiers() (shift, ctrl, alt bool) {
+	shift = s.lShift || s.rShift
+	ctrl = s.lCtrl || s.rCtrl
+	alt = s.lAlt || s.rAlt
+	if s.isAltGr() {
+		ctrl, alt = false, false
+	}
+	return
+}
+
+// ctrlHeld 把消息自带的 MK_CONTROL 位换算成 Ctrl 修饰键；AltGr 自带的左 Ctrl 不算 Ctrl。
+func ctrlHeld(bit bool) bool {
+	return bit && !currentModifiers().isAltGr()
+}
+
+// currentModifiers 读取当前修饰键状态；包级变量便于测试注入 AltGr 等物理键盘不易构造的状态。
+var currentModifiers = readModifiers
+
 // keyModifiers 读取当前键盘修饰键状态，供普通键与系统键共用。
 func keyModifiers() (shift, ctrl, alt bool) {
-	shift = (int32(GetKeyState(VK_SHIFT)) & 0x8000) != 0
-	ctrl = (int32(GetKeyState(VK_CONTROL)) & 0x8000) != 0
-	alt = (int32(GetKeyState(VK_MENU)) & 0x8000) != 0
-	return
+	return currentModifiers().modifiers()
 }
 
 // mouseEventData 构造鼠标事件数据。修饰键取鼠标消息 wParam 的 MK_SHIFT/MK_CONTROL 位，
@@ -692,7 +793,7 @@ func mouseEventData(wParam uintptr, x, y int32, button event.MouseButton) event.
 	return event.MouseData{
 		X: x, Y: y, Button: button,
 		Shift: wParam&MK_SHIFT != 0,
-		Ctrl:  wParam&MK_CONTROL != 0,
+		Ctrl:  ctrlHeld(wParam&MK_CONTROL != 0),
 	}
 }
 
@@ -700,7 +801,7 @@ func mouseEventData(wParam uintptr, x, y int32, button event.MouseButton) event.
 // GetKeyState 反映的是队列快照，滚轮消息必须用消息自带的修饰键位。
 func wheelModifiers(wParam uintptr) (ctrl, shift bool) {
 	low := uint32(wParam) & 0xFFFF
-	return low&MK_CONTROL != 0, low&MK_SHIFT != 0
+	return ctrlHeld(low&MK_CONTROL != 0), low&MK_SHIFT != 0
 }
 
 // handleMessage 处理窗口消息
@@ -728,7 +829,8 @@ func (w *Window) handleMessage(hwnd uintptr, msg uint32, wParam, lParam uintptr)
 		width := int32(LOWORD(lParam))
 		height := int32(HIWORD(lParam))
 		if width > 0 && height > 0 {
-			w.handleResize(width, height)
+			// 只有还原状态下的尺寸才是“正常尺寸”：最大化带来的是工作区尺寸，不能覆盖它
+			w.handleResize(width, height, LOWORD(wParam) == SIZE_RESTORED)
 		}
 		return 0
 
@@ -765,8 +867,17 @@ func (w *Window) handleMessage(hwnd uintptr, msg uint32, wParam, lParam uintptr)
 		// lParam 是系统传入的 MINMAXINFO 指针（Win32 消息 ABI 规定），
 		// 只能从 uintptr 还原；go vet 的 unsafeptr 检查在此处无法通过静态信息证明安全性。
 		if mmi := (*MINMAXINFO)(unsafe.Pointer(lParam)); mmi != nil {
-			// 防止窗口被拖到极小尺寸：折行宽度趋近 0 会让大文档排版退化
-			mmi.MinTrackSize = POINT{X: 640, Y: 400}
+			// 防止窗口被拖到极小尺寸：折行宽度趋近 0 会让大文档排版退化。
+			// 下限随窗口 DPI 缩放（高分屏上 640x400 物理像素装不下同等逻辑内容），
+			// 且不超过所在显示器工作区：远程桌面/小屏上过大的下限会让窗口无法完整落在可见范围。
+			scale := float64(w.GetDPI()) / 96
+			minW := int32(float64(640)*scale + 0.5)
+			minH := int32(float64(400)*scale + 0.5)
+			if work, ok := WindowWorkArea(hwnd); ok {
+				minW = min(minW, work.Right-work.Left)
+				minH = min(minH, work.Bottom-work.Top)
+			}
+			mmi.MinTrackSize = POINT{X: minW, Y: minH}
 		}
 		return 0
 
@@ -817,10 +928,15 @@ func (w *Window) handleMessage(hwnd uintptr, msg uint32, wParam, lParam uintptr)
 
 	case WM_SYSKEYDOWN:
 		keyCode := int(wParam)
-		shift, ctrl, alt := keyModifiers()
+		st := currentModifiers()
+		shift, ctrl, alt := st.modifiers()
 		w.dispatchEvent(event.NewEvent(event.EventKeyDown, event.KeyData{
 			KeyCode: keyCode, Shift: shift, Ctrl: ctrl, Alt: alt,
 		}))
+		// AltGr 组合以系统键到达时是正文输入：AltGr+F4 不能关闭窗口，AltGr+空格不能弹出系统菜单
+		if st.isAltGr() {
+			return 0
+		}
 		// Alt+F4 显式走 WM_CLOSE 链路，确保 SetOnClose 拦截在合成消息与真实消息下
 		// 都具有一致行为；Alt+Space 仍交给系统打开窗口菜单。
 		if keyCode == VK_F4 {
@@ -841,6 +957,13 @@ func (w *Window) handleMessage(hwnd uintptr, msg uint32, wParam, lParam uintptr)
 		return 0
 
 	case WM_SYSCHAR:
+		// AltGr 字符若以系统字符到达，它是正文输入而非菜单加速键：照常派发，
+		// 交给 DefWindowProc 只会在没有匹配助记键时鸣叫。
+		if currentModifiers().isAltGr() {
+			w.dispatchEvent(event.NewEvent(event.EventKeyPress, event.KeyData{
+				Char: rune(uint16(wParam)),
+			}))
+		}
 		// 菜单加速键已在 WM_SYSKEYDOWN 中处理；返回 0 抑制系统提示音。
 		return 0
 
@@ -1026,20 +1149,23 @@ func (w *Window) handleMessage(hwnd uintptr, msg uint32, wParam, lParam uintptr)
 	return DefWindowProc(hwnd, msg, wParam, lParam)
 }
 
-// handleResize 处理窗口大小改变
-func (w *Window) handleResize(width, height int32) {
+// handleResize 处理窗口大小改变。normal 为 true 表示窗口处于还原后的正常状态，
+// 新尺寸同时作为“正常尺寸”记录（GetSize 与下次启动的窗口尺寸都取它）。
+func (w *Window) handleResize(width, height int32, normal bool) {
 	if width <= 0 || height <= 0 {
 		return
 	}
 	if w.renderer == nil {
 		return
 	}
-	if w.config.Width == width && w.config.Height == height {
+	if normal {
+		w.config.Width, w.config.Height = width, height
+	}
+	if w.clientWidth == width && w.clientHeight == height {
 		return
 	}
 
-	oldWidth := w.config.Width
-	oldHeight := w.config.Height
+	oldWidth, oldHeight := w.clientWidth, w.clientHeight
 
 	// 重建 DIB；失败时保持旧尺寸继续运行，绝不把窗口留在空白/半初始化状态。
 	// DIB 只增不减，画布始终按 DIB 尺寸渲染，拖动窗口时不再反复重新分配像素内存。
@@ -1048,8 +1174,6 @@ func (w *Window) handleResize(width, height int32) {
 	}
 	w.bindCanvasToBackBuffer()
 	w.clientWidth, w.clientHeight = width, height
-	w.config.Width = width
-	w.config.Height = height
 
 	// 自动调整根组件大小并重算布局
 	if w.rootComponent != nil {
@@ -1256,9 +1380,22 @@ func (w *Window) GetScale() float64 {
 	return float64(w.GetDPI()) / 96.0
 }
 
-// GetSize 获取窗口大小
+// GetSize 返回正常（非最大化、非最小化）状态下的客户区尺寸。
+// 最大化/最小化期间返回还原后的尺寸：CurrentSettings 持久化窗口大小时取的就是它，
+// 否则关闭时的最大化尺寸会在下次启动变成一个溢出工作区的普通窗口。
 func (w *Window) GetSize() (width, height int32) {
+	if w.hwnd != 0 && (IsZoomed(w.hwnd) || IsIconic(w.hwnd)) {
+		return w.config.Width, w.config.Height
+	}
+	if w.clientWidth > 0 && w.clientHeight > 0 {
+		return w.clientWidth, w.clientHeight
+	}
 	return w.config.Width, w.config.Height
+}
+
+// IsMaximized 报告窗口当前是否处于最大化状态。
+func (w *Window) IsMaximized() bool {
+	return w.hwnd != 0 && IsZoomed(w.hwnd)
 }
 
 // SetSize 设置客户区尺寸（自动换算为包含边框与标题栏的窗口尺寸）。

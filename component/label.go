@@ -211,9 +211,9 @@ func (l *Label) OnEvent(evt event.Event) bool {
 			l.onClick()
 		}
 		return true
-	case event.EventMouseUp:
-		return l.clickable && inside
 	}
+	// 不消费 MouseUp：回调在按下时已经触发，截住释放事件只会让正在拖选的编辑器收不到它，
+	// 选区在没有按键时继续跟随鼠标。
 	return false
 }
 
