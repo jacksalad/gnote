@@ -357,7 +357,7 @@ const shortcutsText = "Ctrl+N/O/S/Shift+S 新建 / 打开 / 保存 / 另存为\n
 	"Alt+F4                退出"
 
 // appVersion 开源正式版本号；历史上的 v3/v4 标记仅为开发期迭代号。
-const appVersion = "1.0.2"
+const appVersion = "1.0.3"
 
 const aboutText = "gnote " + appVersion + "\n\n纯 Go、零 CGO 的 Windows 原生记事本与代码编辑器。\n" +
 	"软件光栅化渲染 · 内嵌字体 · 16 种语法高亮\n\n" +
