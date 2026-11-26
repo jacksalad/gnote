@@ -55,6 +55,19 @@ func FuzzHighlightLine(f *testing.F) {
 	f.Add("@", uint8(11), 0)
 	f.Add("<", uint8(9), 0)
 	f.Add(">*", uint8(12), 0)
+	// 回归种子：YAML 引号字符串的接续行不得被当作文档标记或指令（langSel 14），
+	// 以及 Rust / Markdown / CSS 新状态编码下的最小输入（langSel 依次为 5 / 12 / 10）。
+	f.Add("--- second\"", uint8(14), 10)
+	f.Add("... second\"", uint8(14), 10)
+	f.Add("%TAG x\"", uint8(14), 10)
+	f.Add("--- second'", uint8(14), 11)
+	f.Add("\"#; let x = 1;", uint8(5), 3)
+	f.Add("a \"## b", uint8(5), 5)
+	f.Add("\"#", uint8(5), 2)
+	f.Add("code", uint8(12), 2)
+	f.Add("~~~", uint8(12), 3)
+	f.Add("color: red;", uint8(10), 4)
+	f.Add("*/ .a { x: y; }", uint8(10), 5)
 
 	f.Fuzz(func(t *testing.T, text string, langSel uint8, prev int) {
 		if prev < 0 {

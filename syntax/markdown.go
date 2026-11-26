@@ -10,8 +10,11 @@ import (
 
 // Markdown 跨行解析状态常量
 const (
-	StateNormal          = 0 // 普通文本行
-	StateFencedCodeBlock = 1 // 处于多行围栏代码块内部 (``` 或 ~~~)
+	StateNormal = 0 // 普通文本行
+	// 处于多行围栏代码块内部 (``` 或 ~~~)。闭合围栏必须与开围栏同字符、且不短于开围栏，
+	// 两项都得随状态带到下一行：状态值 = StateFencedCodeBlock + 2 × (围栏长度 - 3) + (波浪线围栏为 1)，
+	// 三个反引号的开围栏仍为 StateFencedCodeBlock。
+	StateFencedCodeBlock = 1
 )
 
 // MarkdownColors 定义 Markdown 各语法元素的调色板令牌
@@ -123,10 +126,15 @@ func (h *MarkdownHighlighter) HighlightLine(lineIndex int, line []rune, prevLine
 	}
 
 	// 1. 处理多行围栏代码块状态
-	if prevLineState == StateFencedCodeBlock {
-		// 检查是否为代码块结束标记 (以 ``` 或 ~~~ 开头)
+	if prevLineState >= StateFencedCodeBlock {
+		// 检查是否为代码块结束标记：与开围栏同字符、长度不短于开围栏
 		trimmed := strings.TrimLeft(string(line), " \t")
-		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+		fence, need := fenceOf(prevLineState)
+		run := 0
+		for run < len(trimmed) && trimmed[run] == fence {
+			run++
+		}
+		if run >= need {
 			spans := []Span{
 				{
 					StartCol: 0,
@@ -147,15 +155,16 @@ func (h *MarkdownHighlighter) HighlightLine(lineIndex int, line []rune, prevLine
 				BgColor:  h.colors.CodeBlockBg,
 			},
 		}
-		return spans, StateFencedCodeBlock
+		return spans, prevLineState
 	}
 
 	// 2. 检查多行代码块开启行 (``` 或 ~~~ 开头)
 	trimmed := strings.TrimLeft(string(line), " \t")
 	if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
 		indent := len(line) - len([]rune(trimmed))
-		markerLen := 3
-		for indent+markerLen < n && (line[indent+markerLen] == '`' || line[indent+markerLen] == '~') {
+		fence := line[indent]
+		markerLen := 1
+		for indent+markerLen < n && line[indent+markerLen] == fence {
 			markerLen++
 		}
 		var spans []Span
@@ -177,7 +186,7 @@ func (h *MarkdownHighlighter) HighlightLine(lineIndex int, line []rune, prevLine
 				Bold:     true,
 			})
 		}
-		return spans, StateFencedCodeBlock
+		return spans, fenceState(fence, markerLen)
 	}
 
 	// 3. 标题行 (# H1, ## H2, ### H3, #### H4 ...)
@@ -403,6 +412,9 @@ func parseList(line []rune) (listType int, prefixEnd int, isTask bool, taskCheck
 func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultColor graphics.Color) []Span {
 	var spans []Span
 	i := start
+	// 向右寻找 ']'、')' 与自动链接终结符的窥探缓存。没配对的标记只让游标前进一格，
+	// 旧实现为下一个同样的标记把剩下的半行重扫一遍，20 万个 '[' 要 7.8 s。
+	bracketSeek, parenSeek, angleSeek := newMDSeek(end), newMDSeek(end), newMDSeek(end)
 
 	for i < end {
 		r := line[i]
@@ -447,21 +459,9 @@ func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultC
 
 		// 2. 图片 (![alt](url))
 		if r == '!' && i+1 < end && line[i+1] == '[' {
-			closeBracket := -1
-			for j := i + 2; j < end; j++ {
-				if line[j] == ']' {
-					closeBracket = j
-					break
-				}
-			}
+			closeBracket := bracketSeek.find(line, i+2, end, mdIsCloseBracket)
 			if closeBracket != -1 && closeBracket+1 < end && line[closeBracket+1] == '(' {
-				closeParen := -1
-				for j := closeBracket + 2; j < end; j++ {
-					if line[j] == ')' {
-						closeParen = j
-						break
-					}
-				}
+				closeParen := parenSeek.find(line, closeBracket+2, end, mdIsCloseParen)
 				if closeParen != -1 {
 					// !
 					spans = append(spans, Span{
@@ -490,21 +490,9 @@ func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultC
 
 		// 3. 超链接 ([text](url))
 		if r == '[' {
-			closeBracket := -1
-			for j := i + 1; j < end; j++ {
-				if line[j] == ']' {
-					closeBracket = j
-					break
-				}
-			}
+			closeBracket := bracketSeek.find(line, i+1, end, mdIsCloseBracket)
 			if closeBracket != -1 && closeBracket+1 < end && line[closeBracket+1] == '(' {
-				closeParen := -1
-				for j := closeBracket + 2; j < end; j++ {
-					if line[j] == ')' {
-						closeParen = j
-						break
-					}
-				}
+				closeParen := parenSeek.find(line, closeBracket+2, end, mdIsCloseParen)
 				if closeParen != -1 {
 					// [text]
 					spans = append(spans, Span{
@@ -608,25 +596,16 @@ func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultC
 		// Markdown 文档不解析行内 HTML，标签一律按正文呈现；此处仅保留
 		// CommonMark 自动链接，且扫描不跨越空白、行内代码反引号与行尾。
 		if r == '<' {
-			closeIdx := -1
-			for j := i + 1; j < end; j++ {
-				if line[j] == '>' {
-					closeIdx = j
-					break
-				}
-				if line[j] == '`' || line[j] == ' ' || line[j] == '\t' {
-					break
-				}
-			}
-			if closeIdx != -1 {
-				target := string(line[i+1 : closeIdx])
+			stop := angleSeek.find(line, i+1, end, mdIsAutolinkStop)
+			if stop != -1 && line[stop] == '>' {
+				target := string(line[i+1 : stop])
 				if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
 					spans = append(spans, Span{
 						StartCol: i,
-						EndCol:   closeIdx + 1,
+						EndCol:   stop + 1,
 						Color:    h.colors.LinkText,
 					})
-					i = closeIdx + 1
+					i = stop + 1
 					continue
 				}
 			}
@@ -655,4 +634,61 @@ func (h *MarkdownHighlighter) parseInlines(line []rune, start, end int, defaultC
 	}
 
 	return spans
+}
+
+// fenceState 把围栏字符与长度编码为围栏代码块状态
+func fenceState(fence rune, length int) int {
+	state := StateFencedCodeBlock + 2*(length-3)
+	if fence == '~' {
+		state++
+	}
+	return state
+}
+
+// fenceOf 解码围栏代码块状态，返回围栏字符与闭合围栏所需的最短长度
+func fenceOf(state int) (fence byte, need int) {
+	v := state - StateFencedCodeBlock
+	fence, need = '`', 3+v/2
+	if v%2 == 1 {
+		fence = '~'
+	}
+	return
+}
+
+// mdSeek 记录 parseInlines 的一次向右窥探：[from, to) 内没有目标符，to 是 from 起第一个目标符
+// (等于行尾表示直到行尾都没有)。窥探请求的位置只增不减，缓存覆盖不到时只从请求位置续扫，
+// 整行里每个字符最多被看一次；纯栈上局部量，不引入分配。
+type mdSeek struct {
+	from, to int
+}
+
+// newMDSeek 建立尚无任何结果的窥探缓存：请求位置必然早于 end，因此总会触发首次扫描
+func newMDSeek(end int) mdSeek {
+	return mdSeek{from: end, to: end}
+}
+
+// find 返回 at 起第一个目标符的位置 (没有则 -1)
+func (s *mdSeek) find(line []rune, at, end int, isTarget func(rune) bool) int {
+	if at < s.from || at > s.to {
+		s.from, s.to = at, end
+		for j := at; j < end; j++ {
+			if isTarget(line[j]) {
+				s.to = j
+				break
+			}
+		}
+	}
+	if s.to == end {
+		return -1
+	}
+	return s.to
+}
+
+func mdIsCloseBracket(r rune) bool { return r == ']' }
+
+func mdIsCloseParen(r rune) bool { return r == ')' }
+
+// mdIsAutolinkStop 自动链接的扫描在 '>'、反引号或空白处停下
+func mdIsAutolinkStop(r rune) bool {
+	return r == '>' || r == '`' || r == ' ' || r == '\t'
 }

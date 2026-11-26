@@ -8,12 +8,64 @@ import (
 	"github.com/jacksalad/gnote/theme"
 )
 
-// CSS 跨行状态常量
+// CSS 跨行状态常量。状态值 = 2 × 花括号深度 + 奇偶位 (1 表示处于 /* ... */ 块注释中)：
+// 规则块内的注释因此记得自己还在块里，嵌套规则闭合之后也仍然留在上一层声明块中。
 const (
 	StateCSSNormal       = 0
-	StateCSSBlockComment = 1 // 处于 /* ... */ 跨行注释中
-	StateCSSRuleBlock    = 2 // 处于 { ... } 样式声明规则块内部
+	StateCSSBlockComment = 1 // 规则块外，处于 /* ... */ 跨行注释中
+	StateCSSRuleBlock    = 2 // 处于 { ... } 样式声明规则块内部 (第一层；每深一层加 2)
 )
+
+// cssMaxDepth 花括号深度的编码上限，只用于防止外来的极大状态值相加后溢出
+const cssMaxDepth = 1 << 20
+
+// cssSelectorUnknown 表示尚未判断当前这条语句是不是嵌套规则的选择器
+const cssSelectorUnknown = -2
+
+// cssState 把花括号深度与“是否处于块注释”编码为跨行状态
+func cssState(depth int, inComment bool) int {
+	if depth > cssMaxDepth {
+		depth = cssMaxDepth
+	}
+	if inComment {
+		return depth*2 + 1
+	}
+	return depth * 2
+}
+
+// cssSelectorEnd 从 i 起寻找这条语句的终结符 '{' ';' '}' (越过字符串与注释)。
+// 是 '{' 说明这条语句是嵌套规则的选择器，返回它的位置；否则返回 -1。
+func cssSelectorEnd(line []rune, i, n int) int {
+	for i < n {
+		switch c := line[i]; c {
+		case '{':
+			return i
+		case ';', '}':
+			return -1
+		case '"', '\'':
+			for i++; i < n && line[i] != c; i++ {
+				if line[i] == '\\' && i+1 < n {
+					i++
+				}
+			}
+			i++
+		case '/':
+			if i+1 >= n || line[i+1] != '*' {
+				i++
+				continue
+			}
+			for i += 2; i < n; i++ {
+				if line[i] == '*' && i+1 < n && line[i+1] == '/' {
+					i += 2
+					break
+				}
+			}
+		default:
+			i++
+		}
+	}
+	return -1
+}
 
 // CSSColors CSS 语法高亮调色板
 type CSSColors struct {
@@ -93,10 +145,15 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 
 	var spans []Span
 	i := 0
-	inBlock := (prevLineState == StateCSSRuleBlock)
+	// 负数不是合法状态，按规则块外的普通文本处理
+	if prevLineState < 0 {
+		prevLineState = StateCSSNormal
+	}
+	depth := prevLineState / 2
+	selEnd := cssSelectorUnknown
 
-	// 1. 处理上一行延续的块注释状态 /* ... */
-	if prevLineState == StateCSSBlockComment {
+	// 1. 处理上一行延续的块注释状态 /* ... */ (规则块内外的注释都带着当时的花括号深度)
+	if prevLineState%2 == 1 {
 		closeIdx := -1
 		for j := 0; j < n-1; j++ {
 			if line[j] == '*' && line[j+1] == '/' {
@@ -112,7 +169,7 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 				Color:    h.colors.Comment,
 				Italic:   true,
 			})
-			return spans, StateCSSBlockComment
+			return spans, prevLineState
 		}
 
 		spans = append(spans, Span{
@@ -161,7 +218,7 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 					Color:    h.colors.Comment,
 					Italic:   true,
 				})
-				return spans, StateCSSBlockComment
+				return spans, cssState(depth, true)
 			}
 			continue
 		}
@@ -230,9 +287,11 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 			continue
 		}
 
-		// 2.6 规则块开启 '{' 与闭合 '}'
+		// 2.6 规则块开启 '{' 与闭合 '}': 是否在规则块内按花括号深度判断，
+		// 嵌套的内层规则闭合之后，外层声明块仍在继续
 		if r == '{' {
-			inBlock = true
+			depth++
+			selEnd = cssSelectorUnknown
 			spans = append(spans, Span{
 				StartCol: i,
 				EndCol:   i + 1,
@@ -243,7 +302,10 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 			continue
 		}
 		if r == '}' {
-			inBlock = false
+			if depth > 0 {
+				depth--
+			}
+			selEnd = cssSelectorUnknown
 			spans = append(spans, Span{
 				StartCol: i,
 				EndCol:   i + 1,
@@ -254,8 +316,36 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 			continue
 		}
 
-		// 2.7 在规则块内部 ({ ... } 声明部分)
-		if inBlock {
+		// 2.7 在规则块内部 ({ ... } 声明部分)。块内一条语句若以 '{' 收尾 (之前没有 ';' 或 '}')，
+		// 它是嵌套规则或 @media 块内那条规则的选择器，改按 2.8 的选择器规则着色
+		inDeclaration := depth > 0
+		if inDeclaration {
+			if selEnd == cssSelectorUnknown {
+				selEnd = cssSelectorEnd(line, i, n)
+			}
+			inDeclaration = i >= selEnd
+		}
+
+		// 数值与带单位尺寸: 10px, 1.5rem, 100%, 0.5s, 45deg。
+		// 规则块外只认数字起始 ('.' 在那里是类选择器)，@media (max-width: 768px) 这样的条件由此着色
+		if unicode.IsDigit(r) || (inDeclaration && r == '.' && i+1 < n && unicode.IsDigit(line[i+1])) {
+			start := i
+			for i < n && (unicode.IsDigit(line[i]) || line[i] == '.') {
+				i++
+			}
+			// 匹配单位后缀: px, rem, em, %, vh, vw, s, ms, deg, fr, pt 等
+			for i < n && (unicode.IsLetter(line[i]) || line[i] == '%') {
+				i++
+			}
+			spans = append(spans, Span{
+				StartCol: start,
+				EndCol:   i,
+				Color:    h.colors.Number,
+			})
+			continue
+		}
+
+		if inDeclaration {
 			// 冒号与分号
 			if r == ':' || r == ';' || r == ',' {
 				spans = append(spans, Span{
@@ -263,6 +353,9 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 					EndCol:   i + 1,
 					Color:    h.colors.Punctuation,
 				})
+				if r == ';' {
+					selEnd = cssSelectorUnknown // 一条声明结束，下一条语句重新判断
+				}
 				i++
 				continue
 			}
@@ -272,24 +365,6 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 				start := i
 				i++
 				for i < n && (unicode.IsDigit(line[i]) || (line[i] >= 'a' && line[i] <= 'f') || (line[i] >= 'A' && line[i] <= 'F')) {
-					i++
-				}
-				spans = append(spans, Span{
-					StartCol: start,
-					EndCol:   i,
-					Color:    h.colors.Number,
-				})
-				continue
-			}
-
-			// 数值与带单位尺寸: 10px, 1.5rem, 100%, 0.5s, 45deg
-			if unicode.IsDigit(r) || (r == '.' && i+1 < n && unicode.IsDigit(line[i+1])) {
-				start := i
-				for i < n && (unicode.IsDigit(line[i]) || line[i] == '.') {
-					i++
-				}
-				// 匹配单位后缀: px, rem, em, %, vh, vw, s, ms, deg, fr, pt 等
-				for i < n && (unicode.IsLetter(line[i]) || line[i] == '%') {
 					i++
 				}
 				spans = append(spans, Span{
@@ -347,8 +422,8 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 			continue
 		}
 
-		// 2.8 在规则块外部 (选择器部分: .btn, #header, div, :hover 等)
-		if r == '.' || r == '#' || r == ':' {
+		// 2.8 在规则块外部 (选择器部分: .btn, #header, div, :hover, 嵌套的 & 等)
+		if r == '.' || r == '#' || r == ':' || r == '&' {
 			start := i
 			i++
 			// 支持 :: 伪元素
@@ -391,8 +466,5 @@ func (h *CSSHighlighter) HighlightLine(lineIndex int, line []rune, prevLineState
 		i++
 	}
 
-	if inBlock {
-		return spans, StateCSSRuleBlock
-	}
-	return spans, StateCSSNormal
+	return spans, cssState(depth, false)
 }

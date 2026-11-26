@@ -12,8 +12,14 @@ import (
 const (
 	StateRustNormal       = 0
 	StateRustBlockComment = 1 // 处于 /* ... */ 跨行注释中
-	StateRustRawString    = 2 // 处于 r"..." 或 r#"..."# 跨行原生字符串中
+	// 处于 r"..." 或 r#"..."# 跨行原生字符串中。'#' 的个数决定闭合序列，必须随状态带到下一行：
+	// 状态值为 StateRustRawString + '#' 的个数 (r" 为 2，r#" 为 3，以此类推)。
+	StateRustRawString = 2
 )
+
+// 泛型调用窥探 (标识符后跟 '<' 时向右找匹配的 '>') 的单次窗口上限。
+// 超出窗口的泛型实参列表不按函数调用着色；实际代码远达不到这个长度。
+const rustGenericLookahead = 512
 
 // RustColors Rust 语法高亮调色板
 type RustColors struct {
@@ -126,6 +132,7 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 
 	var spans []Span
 	i := 0
+	var angleSeek rustAngleSeek
 
 	// 1. 处理上一行延续的跨行状态
 	if prevLineState == StateRustBlockComment {
@@ -154,19 +161,14 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 			Italic:   true,
 		})
 		i = closeIdx
-	} else if prevLineState == StateRustRawString {
-		// 原生字符串在下一行寻找闭合引号 '"' 与 '#'
+	} else if prevLineState >= StateRustRawString {
+		// 原生字符串在下一行寻找闭合引号 '"' 与同样个数的 '#'
+		hashes := prevLineState - StateRustRawString
 		closeIdx := -1
 		for j := 0; j < n; j++ {
-			if line[j] == '"' {
-				if j+1 < n && line[j+1] == '#' {
-					k := j + 1
-					for k < n && line[k] == '#' {
-						k++
-					}
-					closeIdx = k
-					break
-				}
+			if line[j] == '"' && rustRawStringClosed(line, j, hashes) {
+				closeIdx = j + 1 + hashes
+				break
 			}
 		}
 
@@ -176,7 +178,7 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 				EndCol:   n,
 				Color:    h.colors.String,
 			})
-			return spans, StateRustRawString
+			return spans, prevLineState
 		}
 
 		spans = append(spans, Span{
@@ -277,19 +279,10 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 					i = temp + 1
 					closed := false
 					for i < n {
-						if line[i] == '"' {
-							match := true
-							for k := 0; k < hashes; k++ {
-								if i+1+k >= n || line[i+1+k] != '#' {
-									match = false
-									break
-								}
-							}
-							if match {
-								i += 1 + hashes
-								closed = true
-								break
-							}
+						if line[i] == '"' && rustRawStringClosed(line, i, hashes) {
+							i += 1 + hashes
+							closed = true
+							break
 						}
 						i++
 					}
@@ -305,7 +298,7 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 							EndCol:   n,
 							Color:    h.colors.String,
 						})
-						return spans, StateRustRawString
+						return spans, StateRustRawString + hashes
 					}
 					continue
 				}
@@ -520,26 +513,7 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 				if peek < n && line[peek] == '(' {
 					isFunc = true
 				} else if peek < n && line[peek] == '<' {
-					depth := 0
-					k := peek
-					for k < n {
-						if line[k] == '<' {
-							depth++
-						} else if line[k] == '>' {
-							depth--
-							if depth == 0 {
-								k++
-								break
-							}
-						}
-						k++
-					}
-					for k < n && unicode.IsSpace(line[k]) {
-						k++
-					}
-					if k < n && line[k] == '(' {
-						isFunc = true
-					}
+					isFunc = angleSeek.genericCall(line, peek)
 				}
 				if isFunc {
 					spans = append(spans, Span{
@@ -606,4 +580,66 @@ func (h *RustHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 	}
 
 	return spans, StateRustNormal
+}
+
+// rustRawStringClosed 报告 line[at] 处的 '"' 是否闭合带 hashes 个 '#' 的原生字符串。
+// 与 rustc 一致：引号后必须恰好跟着 hashes 个 '#'，多出来的 '#' 属于内容而不是闭合序列
+// (r#"a"##b"# 的内容是 a"##b)。hashes 可能来自外来的状态值，因此按剩余长度截断而不做加法。
+func rustRawStringClosed(line []rune, at, hashes int) bool {
+	for k := 1; k <= hashes; k++ {
+		if k >= len(line)-at || line[at+k] != '#' {
+			return false
+		}
+	}
+	return hashes+1 >= len(line)-at || line[at+hashes+1] != '#'
+}
+
+// rustAngleSeek 记录一行里已知不含 '>' 的区间 [from, to)，供泛型调用窥探复用。
+type rustAngleSeek struct {
+	from, to int
+}
+
+// genericCall 报告 line[at] 处的 '<' 是否开启泛型实参列表：在其后 rustGenericLookahead 个 rune
+// 内配平，且 (跳过空白) 紧跟 '('。
+// 比较运算符链 (a < b && c < d) 里的 '<' 永远等不到闭合的 '>'，旧实现为每个标识符扫到行尾，
+// 耗时随行长平方增长 (20 万字符的比较表达式要 1.2–3.1 s)。窥探位置只增不减，
+// 这里把“没有 '>'”的区间当作只向前延伸的游标：整行每个字符最多被看一次。
+func (s *rustAngleSeek) genericCall(line []rune, at int) bool {
+	n := len(line)
+	limit := at + rustGenericLookahead
+	if limit > n {
+		limit = n
+	}
+	if at < s.from || limit > s.to {
+		// 区间与本次窗口相连时只延伸缺的一段，否则从当前位置重新建立
+		scan := at
+		if at >= s.from && s.to > scan {
+			scan = s.to
+		}
+		s.from = at
+		for ; scan < limit; scan++ {
+			if line[scan] == '>' {
+				break
+			}
+		}
+		s.to = scan
+	}
+	if s.to < limit {
+		// 窗口里有 '>'，才值得做括号配对
+		depth := 0
+		for k := at; k < limit; k++ {
+			switch line[k] {
+			case '<':
+				depth++
+			case '>':
+				depth--
+				if depth == 0 {
+					for k++; k < n && unicode.IsSpace(line[k]); k++ {
+					}
+					return k < n && line[k] == '('
+				}
+			}
+		}
+	}
+	return false
 }

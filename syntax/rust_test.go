@@ -68,11 +68,11 @@ func TestRustHighlighter_RawStringsAndAttributes(t *testing.T) {
 	h := syntax.NewRustHighlighter()
 	colors := h.GetColors()
 
-	// 行 1: 属性注解与原生字符串开启
+	// 行 1: 属性注解与原生字符串开启 (r#" 带一个 '#'，状态随之 +1)
 	line1 := []rune(`#[derive(Debug)] const JSON: &str = r#"{"name": "Rust",`)
 	spans1, state1 := h.HighlightLine(0, line1, syntax.StateRustNormal)
-	if state1 != syntax.StateRustRawString {
-		t.Fatalf("expected StateRustRawString on line 1, got %d", state1)
+	if state1 != syntax.StateRustRawString+1 {
+		t.Fatalf("expected StateRustRawString+1 on line 1, got %d", state1)
 	}
 
 	foundAttr := false
@@ -89,8 +89,8 @@ func TestRustHighlighter_RawStringsAndAttributes(t *testing.T) {
 	// 行 2: 原生字符串内部
 	line2 := []rune(`   "fast": true}`)
 	spans2, state2 := h.HighlightLine(1, line2, state1)
-	if state2 != syntax.StateRustRawString {
-		t.Fatalf("expected StateRustRawString on line 2, got %d", state2)
+	if state2 != syntax.StateRustRawString+1 {
+		t.Fatalf("expected StateRustRawString+1 on line 2, got %d", state2)
 	}
 	if len(spans2) != 1 || spans2[0].Color != colors.String {
 		t.Fatalf("expected string color on line 2")

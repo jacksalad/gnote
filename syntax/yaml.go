@@ -125,6 +125,9 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 
 	var spans []Span
 	i := 0
+	// 行首是否为跨行引号字符串的接续：是的话开头整段都是字符串内容，不能再识别文档标记与指令，
+	// 否则 String 与 Directive 两个片段会重叠
+	continued := prevLineState == StateYAMLDoubleQuote || prevLineState == StateYAMLSingleQuote
 
 	// 2. 处理跨行双引号字符串
 	if prevLineState == StateYAMLDoubleQuote {
@@ -188,7 +191,7 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 
 	// 4. 文档标记与指令 (---, ..., %YAML)
 	trimmedLeading := strings.TrimSpace(string(line))
-	if strings.HasPrefix(trimmedLeading, "---") || strings.HasPrefix(trimmedLeading, "...") {
+	if !continued && (strings.HasPrefix(trimmedLeading, "---") || strings.HasPrefix(trimmedLeading, "...")) {
 		spans = append(spans, Span{
 			StartCol: lineIndent,
 			EndCol:   lineIndent + 3,
@@ -210,7 +213,7 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 		}
 		return spans, StateYAMLNormal
 	}
-	if strings.HasPrefix(trimmedLeading, "%") {
+	if !continued && strings.HasPrefix(trimmedLeading, "%") {
 		spans = append(spans, Span{
 			StartCol: lineIndent,
 			EndCol:   n,
@@ -222,6 +225,7 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 
 	// 5. 扫描各词法单元
 	blockScalarIndent := -1
+	keyStop := -1 // 当前标量起第一个“键名窥探停顿符”的位置 (n 表示到行尾都没有)，-1 表示尚未窥探
 
 	for i < n {
 		r := line[i]
@@ -434,44 +438,45 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 		}
 
 		// 检查当前位置是否为普通键名或值
-		// 探测向前直到下一个关键符号 (:, #, ,, ], })
 		start := i
-		// 寻找当前词边界
-		hasColonMapping := false
-		colonPos := -1
 
-		// 向前窥探这一行是否存在作为映射键的冒号 (后跟空白或行尾)
-		for scan := i; scan < n; scan++ {
-			if line[scan] == '#' || line[scan] == ',' || line[scan] == ']' || line[scan] == '}' {
-				break
-			}
-			if line[scan] == ':' && (scan+1 == n || unicode.IsSpace(line[scan+1]) || line[scan+1] == ',' || line[scan+1] == '}' || line[scan+1] == ']') {
-				hasColonMapping = true
-				colonPos = scan
-				break
+		// 向前窥探这一行是否存在作为映射键的冒号 (后跟空白或行尾)。
+		// 每个标量都要窥探一次：逐词的标量序列 (纯数字列表等) 会把同一行尾反复扫描，
+		// “m: ” 后跟 10 万个 “1 ” 要 11 s。结果按位置缓存：标量起点只增不减，
+		// 缓存落在起点之前时才从起点续扫，整行每个字符最多被看一次。
+		if keyStop < i {
+			keyStop = n
+			for scan := i; scan < n; scan++ {
+				if yamlAtKeyStop(line, scan, n) {
+					keyStop = scan
+					break
+				}
 			}
 		}
 
-		if hasColonMapping && colonPos >= start {
+		if keyStop < n && line[keyStop] == ':' {
 			// 当前片段是键名 (Key)
-			keyEnd := colonPos
+			keyEnd := keyStop
 			// 修剪尾部空格
 			for keyEnd > start && unicode.IsSpace(line[keyEnd-1]) {
 				keyEnd--
 			}
-			spans = append(spans, Span{
-				StartCol: start,
-				EndCol:   keyEnd,
-				Color:    h.colors.Key,
-				Bold:     true,
-			})
+			// 空键 (如 “- : value”) 没有键名可着色，不能产出零长度片段
+			if keyEnd > start {
+				spans = append(spans, Span{
+					StartCol: start,
+					EndCol:   keyEnd,
+					Color:    h.colors.Key,
+					Bold:     true,
+				})
+			}
 			// 冒号作为分隔符
 			spans = append(spans, Span{
-				StartCol: colonPos,
-				EndCol:   colonPos + 1,
+				StartCol: keyStop,
+				EndCol:   keyStop + 1,
 				Color:    h.colors.Punctuation,
 			})
-			i = colonPos + 1
+			i = keyStop + 1
 			continue
 		}
 
@@ -536,6 +541,25 @@ func (h *YAMLHighlighter) HighlightLine(lineIndex int, line []rune, prevLineStat
 		return spans, StateYAMLBlockScalarBase + blockScalarIndent
 	}
 	return spans, StateYAMLNormal
+}
+
+// yamlAtKeyStop 报告 scan 处是否终止键名窥探：注释与流式分隔符，
+// 或后跟空白、行尾、流式分隔符的冒号 (映射的 “键: 值” 写法)
+func yamlAtKeyStop(line []rune, scan, n int) bool {
+	switch line[scan] {
+	case '#', ',', ']', '}':
+		return true
+	case ':':
+		if scan+1 == n {
+			return true
+		}
+		switch line[scan+1] {
+		case ',', ']', '}':
+			return true
+		}
+		return unicode.IsSpace(line[scan+1])
+	}
+	return false
 }
 
 // appendStringWithEscapes 分词双引号字符串中的转义符
